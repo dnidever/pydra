@@ -1,12 +1,8 @@
 # Packages that allow us to get information about objects:
-import asdf
 import os
 import numpy as np
 from astropy.table import Table
 from dlnpyutils import utils as dln,robust
-
-from jwst.extract_1d.extract_1d_step import Extract1dStep
-from jwst.extract_1d import extract as jextract
 
 # Astropy tools:
 from astropy.io import fits

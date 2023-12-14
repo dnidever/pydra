@@ -1,112 +1,93 @@
 # Packages that allow us to get information about objects:
-import asdf
+
 import os
 import numpy as np
 from astropy.table import Table
-from dlnpyutils import utils as dln,robust
+from dlnpyutils import utils as dln,robust,plotting as pl
 import tempfile
 import shutil
 import traceback
-
-# Astropy tools:
 from astropy.io import fits
-
-import jwst
-
-# JWST data models
-from jwst import datamodels
-
-# The entire calwebb_spec2 pipeline
-from jwst.pipeline.calwebb_spec2 import Spec2Pipeline
-
-# Individual steps that make up calwebb_spec2 and datamodels
-from jwst.assign_wcs.assign_wcs_step import AssignWcsStep
-from jwst.background.background_step import BackgroundStep
-from jwst.imprint.imprint_step import ImprintStep
-from jwst.msaflagopen.msaflagopen_step import MSAFlagOpenStep
-from jwst.extract_2d.extract_2d_step import Extract2dStep
-from jwst.srctype.srctype_step import SourceTypeStep
-from jwst.master_background.master_background_step import MasterBackgroundStep
-from jwst.wavecorr.wavecorr_step import WavecorrStep
-from jwst.flatfield.flat_field_step import FlatFieldStep
-from jwst.straylight.straylight_step import StraylightStep
-from jwst.fringe.fringe_step import FringeStep
-from jwst.pathloss.pathloss_step import PathLossStep
-from jwst.barshadow.barshadow_step import BarShadowStep
-from jwst.photom.photom_step import PhotomStep
-from jwst.resample import ResampleSpecStep
-from jwst.cube_build.cube_build_step import CubeBuildStep
-from jwst.extract_1d.extract_1d_step import Extract1dStep
-from jwst.extract_1d import extract as jextract
-
 from scipy.ndimage.filters import median_filter, gaussian_filter
-
 from glob import glob
 import doppler
 from doppler.spec1d import Spec1D
-from . import extract, utils, sincint, qa
-
 import matplotlib
 import matplotlib.pyplot as plt
-from dlnpyutils import plotting as pl
+from . import extract, utils, ccdproc
 
+def get(lines,key):
+    hkey = key.upper()
+    if len(hkey)<8:
+        hkey += (8-len(hkey))*' '
+    hkey += '='
+    res = dln.grep(lines,hkey)
+    if len(res)==0:
+        return ''
+    if len(res)>0:
+        res = res[0]
+    if res.find('=')==-1:
+        return ''
+    value = res.split('=')[1]
+    if value.find('/')>-1:
+        value = value.split('/')[0]
+    value = value.replace("'",'')
+    value = value.strip()
+    return value
 
-def getexpinfo(obsname,logger=None,redtag='red'):
+def getexpinfo(dirname,logger=None,redtag='red'):
 
     #if logger is None: logger=dln.basiclogger()
     
-    print('Looking for data for obsname='+obsname)
-    files = glob(obsname+'*'+redtag+'*')
+    print('Getting exposure information for ',dirname)
+    files = glob(dirname+'/c4s_*.fits')
+    files += glob(dirname+'/c4s_*.fits.fz')
     nfiles = len(files)
     if len(files)==0:
-        raise ValueError('No files found for '+obsname)    
-    #dirs = glob(obsname+'*')
-    ## Only want directories
-    #dirs = [d for d in dirs if os.path.isdir(d)]
-    #dirs = [d for d in dirs if (d.endswith('_nrs1') or d.endswith('_nrs2'))]
-    #if len(dirs)==0:
-    #    raise ValueError('No directories found for '+obsname)
+        raise ValueError('No files found')
     
     # Get exposures names
-    #base = [d[:-5] for d in dirs]
-    base = [os.path.basename(f) for f in files]
-    base = [b[:b.find('_nrs')] for b in base]
-    expnames = np.unique(base)
-    nexp = len(expnames)
+    basename = [os.path.basename(f) for f in files]
+    nexp = len(files)
     print('Found '+str(nexp)+' exposures')
     
+    night = dirname.split('/')[5]
+
     # Check the _red.fits files and get basic information
-    edict = []
+    dt = [('directory',str,200),('filename',str,200),('night',str,20),('base',str,50),('nx',int),('ny',int),
+          ('date-obs',str,40),('imagetyp',str,20),('exptime',float),('object',str,50),('instrument',str,50),
+          ('detector',str,50),('ra',str,30),('dec',str,30),('fldname',str,50),('gratangl',str,20),
+          ('filter',str,20),('nfibers',int)]
+    info = Table(np.zeros(nexp,dtype=np.dtype(dt)))
     for i in range(nexp):
-        expname = expnames[i]
-        #calfile = expname+'_nrs1/'+expname+'_nrs1_cal.fits'
-        calfile = expname+'_nrs1_'+redtag+'.fits'
-        if os.path.exists(calfile)==False:
-            print(calfile+' NOT FOUND')
-            continue
-        hd = fits.getheader(calfile,0)
-        hdict = {'FILENAME':calfile,'EXPNAME':expname}
-        cards = ['OPMODE','EXP_TYPE','FILTER','GRATING','INSTRUMENT','DETECTOR','TARG_RA','TARG_DEC','VISITID',
-                 'VISIT','EXPOSURE','OBSLABEL','NOD_TYPE','APERNAME','DATE-BEG']
-        for c in cards: hdict[c]=hd.get(c)
-        # Observation ID
-        hdict['OBSID'] = hdict['GRATING']+'-'+hdict['FILTER']+'-'+hdict['OBSLABEL']
-        
-        # Only reduce exposures that are dispersed
-        # Dispersed has
-        #  EXP_TYPE= 'NRS_MSASPEC' 
-        #  GRATING = 'G140H'        
-        # Imaging has
-        #  EXP_TYPE = 'NRS_MSATA'
-        #  GRATING = 'MIRROR' 
-        if hdict['GRATING']=='MIRROR':
-            print('This is not a dispersed exposure.  Skipping')
-            continue
+        base = basename[i]
+        base = base.replace('.fits','').replace('.fz','')
+        headfile = dirname+'/'+base+'.hdr'
+        head = dln.readlines(headfile)
+        info['directory'][i] = dirname
+        info['filename'][i] = files[i]
+        info['night'][i] = night
+        info['base'][i] = basename[i]
+        info['nx'][i] = get(head,'naxis1')
+        info['ny'][i] = get(head,'naxis2')
+        info['date-obs'][i] = get(head,'date-obs')
+        info['imagetyp'][i] = get(head,'imagetyp')
+        info['exptime'][i] = get(head,'exptime')
+        info['object'][i] = get(head,'object')
+        info['instrument'][i] = get(head,'instrument')
+        info['detector'][i] = get(head,'detector')
+        info['ra'][i] = get(head,'ra')
+        info['dec'][i] = get(head,'dec')
+        info['fldname'][i] = get(head,'fldname')
+        info['gratangl'][i] = get(head,'gratangl')
+        info['filter'][i] = get(head,'filter')
+        fibs = dln.grep(head,'SLFIB')
+        fibs = [f for f in fibs if f.find('not assigned')==-1]
+        fibs = [f for f in fibs if f.find('Random position')==-1]
+        fibs = [f for f in fibs if f.find('Not available')==-1]        
+        info['nfibers'][i] = len(fibs) 
 
-        # Add to the list
-        edict.append(hdict)
-
-    return edict
+    return info
 
 def joinspec(sp1,sp2):
     """ Combine NRS1 and NRS2."""
@@ -355,32 +336,68 @@ def stackspec(splist):
     
     return comb,stack
 
-def process(fileinput,outdir='./',clobber=False):
-    """ Process multiple rate files using JWST calwebb_spec2 pipeline."""
-    files = glob(fileinput)
-    nfiles = len(files)
-    print(nfiles,' files found for ',fileinput)
+def process(dirname,outdir='./',clobber=False):
+    """ Process an entire night of data."""
+    expinfo = getexpinfo(dirname)
+    nfiles = len(expinfo)
     if nfiles==0:
         return
-    for f in files: print(f)
+    expinfo['exptype'] = 20*' '
+    expinfo['success'] = False
+    expinfo['redfile'] = 200*' '
+
+    # Process everything in a temporary directory
+    workdir = '/data0/dnidever/hydra/'
+    tempdir = tempfile.mkdtemp(prefix="hydra",dir=workdir)
+    print('Processing data in ',tempdir)
+
+    # Make Master calibration files
+    #------------------------------
+
+    # Bias
+    print('Making master bias')
+    biasind, = np.where(expinfo['exptime']==0)
+    biasfile = tempdir+'/dark.fits'
+    bias,bhead = ccdproc.masterbias(expinfo['filename'][biasind],outfile=biasfile,verbose=True)
+    expinfo['exptype'][biasind] = 'bias'
+    ny,nx = bias.shape
+
+    # Flat ??
+
+    # ccdproc
+    ind, = np.where(expinfo['exptime']>0)
+    expinfo['exptype'][ind] = 'object'
+    for i in range(len(ind)):
+        einfo = expinfo[ind[i]]
+        filename = einfo['filename']
+        base = os.path.basename(filename).replace('.fz','').replace('.fits','')
+        print('---- {:d}/{:d} {:s} ({},{}) {:s} {:.1f} ----'.format(i+1,len(ind),base,einfo['nx'],einfo['ny'],einfo['imagetyp'],einfo['exptime']))
+        outfile = tempdir+'/'+base+'.fits'
+        try:
+            ccdproc.ccdproc([filename],zero=bias,outfile=outfile,verbose=True)
+            expinfo['success'][ind[i]] = True
+            expinfo['redfile'][ind[i]] = outfile
+        except:
+            expinfo['success'][ind[i]] = False
+            traceback.print_exc()
+
+    # Create PSF from flat files
+    flatind, = np.where((np.char.array(expinfo['imagetyp']).find('FLAT')>-1) &
+                        (expinfo['success']==True))
+    print(len(flatind),' FLAT exposures')
+    imarr = np.zeros((len(flatind),ny,nx),float)
+    for i in range(len(flatind)):
+        im,head = fits.getdata(expinfo['redfile'][flatind[i]],0,header=True)
+        imarr[i,:,:] = im
+    med = np.median(imarr[:,1000:1100,:],axis=1)
+
+    # spectra are vertical
+    # fibers are ~12 pixels apart
+
+    # the trace positions do move around a little bit
+
+    import pdb; pdb.set_trace()
     
-    # File loop
-    for i in range(nfiles):
-        filename = files[i]
-        print(' ')
-        print('------------------------------------------------------------')        
-        print(i+1,filename)
-        print('------------------------------------------------------------')
-        print(' ')
-        # Check that it's a dispersed exposures
-        hdu = fits.open(filename)
-        filt = hdu[0].header['filter']
-        grating = hdu[0].header['grating']
-        hdu.close()
-        if grating=='MIRROR':
-            print('NOT a dispersed image')
-            continue
-        res = process_exp(filename,outdir=outdir,clobber=clobber)
     
     
 

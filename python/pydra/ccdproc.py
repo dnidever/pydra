@@ -139,7 +139,7 @@ def fixheader(head):
 
     
 def overscan(im,head,verbose=False):
-    """ This calculate the overscan and subtracts it from the data and then trims off the overscan region"""
+    """ This calculates the overscan and subtracts it from the data and then trims off the overscan region"""
     # y = [0:40] and [3429:3464]
     # x = [0:13] and [2726:2727]
     # DATA = [14:2725,41:3428]
@@ -318,7 +318,10 @@ def masterbias(files,med=False,outfile=None,clobber=True,verbose=False):
         print('Creating master bias using '+str(nfiles)+' files')
     # File loop    
     for i in range(nfiles):
-        im,head = fits.getdata(files[i],0,header=True)
+        if files[i].endswith('.fz'):
+            im,head = fits.getdata(files[i],1,header=True)
+        else:
+            im,head = fits.getdata(files[i],0,header=True)
         sh = im.shape
         if verbose:
             print(str(i+1)+' '+files[i]+' ['+str(sh[1])+','+str(sh[0])+']')        
@@ -414,7 +417,10 @@ def masterdark(files,zero,med=False,outfile=None,clobber=True,verbose=False):
         
     # File loop        
     for i in range(nfiles):
-        im,head = fits.getdata(files[i],0,header=True)
+        if files[i].endswith('.fz'):
+            im,head = fits.getdata(files[i],1,header=True)
+        else:
+            im,head = fits.getdata(files[i],0,header=True)
         sh = im.shape
         if verbose:
             print(str(i+1)+' '+files[i]+' ['+str(sh[1])+','+str(sh[0])+'] '+str(head['exptime'])+' sec')
@@ -521,7 +527,10 @@ def masterflat(files,zero,dark,med=False,sigclip=False,outfile=None,clobber=True
 
     # File loop
     for i in range(nfiles):
-        im,head = fits.getdata(files[i],0,header=True)
+        if files[i].endswith('.fz'):
+            im,head = fits.getdata(files[i],1,header=True)
+        else:
+            im,head = fits.getdata(files[i],0,header=True)
         sh = im.shape
         # Fix header, if necessary
         if (head.get('TRIMSEC') is None) | (head.get('BIASSEC') is None):
@@ -738,7 +747,10 @@ def masterspecflat(files,zero=None,dark=None,spectral_axis=1,outfile=None,
 
     # File loop
     for i in range(nfiles):
-        im,head = fits.getdata(files[i],0,header=True)
+        if files[i].endswith('.fz'):
+            im,head = fits.getdata(files[i],1,header=True)
+        else:
+            im,head = fits.getdata(files[i],0,header=True)
         sh = im.shape
         # Fix header, if necessary
         if (head.get('TRIMSEC') is None) | (head.get('BIASSEC') is None):
@@ -975,7 +987,10 @@ def ccdproc(data,head=None,bpm=None,zero=None,dark=None,flat=None,outfile=None,o
             if verbose:
                 print('Loading '+files[i])
             if os.path.exists(files[i]):
-                im,head = fits.getdata(files[i],0,header=True)
+                if files[i].endswith('.fz'):
+                    im,head = fits.getdata(files[i],1,header=True)
+                else:
+                    im,head = fits.getdata(files[i],0,header=True)
             else:
                 raise ValueError(files[i]+' NOT FOUND')            
         
