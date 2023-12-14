@@ -14,7 +14,7 @@ import doppler
 from doppler.spec1d import Spec1D
 import matplotlib
 import matplotlib.pyplot as plt
-from . import extract, utils, ccdproc
+from . import extract, utils, ccdproc, trace
 
 def get(lines,key):
     hkey = key.upper()
@@ -395,6 +395,12 @@ def process(dirname,outdir='./',clobber=False):
     # fibers are ~12 pixels apart
 
     # the trace positions do move around a little bit
+
+    import pdb; pdb.set_trace()
+
+    im = imarr[0,:,:]
+    ttab = trace.findtrace(im.T,hratio2=0.9)
+
 
     import pdb; pdb.set_trace()
     
