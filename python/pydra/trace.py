@@ -10,12 +10,124 @@ from scipy import ndimage
 from scipy.interpolate import interp1d
 from numba import njit
 from dlnpyutils import utils as dln,robust,mmm
+import matplotlib.pyplot as plt
 #from . import utils,robust,mmm
 
-class Trace():
+class Traces():
+    """
+    Class to hold multiple spectral traces.
+    """
 
-    def __init__(self):
-        self._data = None
+    def __init__(self,data=None):
+        # Input a trace list
+        self._data = data
+        self._xmin = None
+        self._xmax = None
+        self._ymin = None
+        self._ymax = None        
+        
+    def __len__(self):
+        if self._data is None:
+            return 0
+        else:
+            return len(self._data)
+
+    @property
+    def hasdata(self):
+        if self._data is None:
+            return False
+        else:
+            return True
+        
+    @property
+    def xmin(self):
+        if self._xmin is None:
+            xmin = np.inf
+            for t in self:
+                xmin = min(xmin,t.xmin)
+            self._xmin = xmin
+        return self._xmin
+
+    @property
+    def xmax(self):
+        if self._xmax is None:
+            xmax = -np.inf
+            for t in self:
+                xmax = max(xmax,t.xmax)
+            self._xmax = xmax
+        return self._xmax
+
+    @property
+    def ymin(self):
+        if self._ymin is None:
+            ymin = np.inf
+            for t in self:
+                ymin = min(ymin,t.ymin)
+            self._ymin = ymin
+        return self._ymin
+
+    @property
+    def ymax(self):
+        if self._ymax is None:
+            ymax = -np.inf
+            for t in self:
+                ymax = max(ymax,t.ymax)
+            self._ymax = ymax
+        return self._ymax    
+        
+    def __repr__(self):
+        prefix = self.__class__.__name__ + '('
+        if self.hasdata:
+            body = '{:d} traces, '.format(len(self))
+            body += 'X=[{:.1f},{:.1f}]'.format(self.xmin,self.xmax)
+            body += ',Y=[{:.1f},{:.1f}]'.format(self.ymin,self.ymax)
+        else:
+            body = ''
+        out = ''.join([prefix, body, ')']) +'\n'
+        return out
+        
+    def __getitem__(self,item):
+        # Single trace
+        if type(item) is int:
+            if item > len(self)-1:
+                raise IndexError('Traces index out of range')
+            return Trace(self._data[item])
+        # Multiple traces
+        elif type(item) is tuple or type(item) is slice:
+            index = np.arange(len(self))
+            index = index[item]  # apply it to the indices
+            data = len(index)*[None]
+            for i in range(len(index)):
+                data[i] = self._data[index[i]]  # by reference
+            return Traces(data)
+        else:
+            raise ValueError('index not understood')
+
+    def __iter__(self):
+        self._count = 0
+        return self
+        
+    def __next__(self):
+        if self._count < len(self):
+            self._count += 1            
+            return self[self._count-1]
+        else:
+            raise StopIteration
+
+    def copy(self):
+        return Traces(self._data.copy())
+        
+    def plot(self,**kwargs):
+        for t in self:
+            t.plot(**kwargs)
+        
+class Trace():
+    """
+    Class for a single spectral trace.
+    """
+    
+    def __init__(self,data=None):
+        self._data = data
 
     def __call__(self,x=None):
         """ Return the trace path."""
@@ -23,13 +135,12 @@ class Trace():
             raise ValueError('No trace data yet')
         if x is None:
             x = np.arange(self._data['xmin'],self._data['xmax'])
-        # Get the curve
+        # Get the curve/path
         y = np.polyval(self._data['tcoef'],x)
         out = np.zeros(len(x),dtype=np.dtype([('x',float),('y',float)]))
         out['x'] = x
         out['y'] = y
         return out     
-
 
     
     def __len__(self):
@@ -37,7 +148,14 @@ class Trace():
             return 0
         else:
             return 1
-    
+
+    @property
+    def size(self):
+        if self._data is None:
+            return 0
+        else:
+            return len(self._data)
+        
     def __repr__(self):
         prefix = self.__class__.__name__ + '('
         if self.hasdata:
@@ -58,7 +176,21 @@ class Trace():
             return False
         else:
             return True
-    
+
+    @property
+    def x(self):
+        if self._data is None:
+            return None
+        else:
+            return self._data['xvalues']
+
+    @property
+    def y(self):
+        if self._data is None:
+            return None
+        else:
+            return self._data['yvalues']        
+        
     @property
     def data(self):
         if self.hasdata==False:
@@ -131,6 +263,12 @@ class Trace():
         # Determine dispersion axis
         #  the axis with no ambiguities/degeneracies, single-valued
 
+    def copy(self):
+        return Trace(self._data.copy())
+        
+    def plot(self,**kwargs):
+        out = self()
+        plt.plot(out['x'],out['y'],**kwargs)
 
 @njit
 def gvals(x,y):
@@ -309,6 +447,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.8,
     peaks = ( (medim >= rollyn1) & (medim >= rollyp1) &
               (rollyp2 < hratio2*medim) & (rollyn2 < hratio2*medim) &
 	      (medim > height_thresh))
+    
     # Now require trace heights to be within ~30% of at least one neighboring
     #   median-filtered column block
     peaksht = ((np.abs(medim[peaks]-rollxp1[peaks])/medim[peaks] < neifluxratio) |
@@ -418,12 +557,12 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.8,
             itrace['xvalues'].append(xmed[xb])                
             itrace['heights'].append(medim[yleft[j],xb])
             tracelist.append(itrace)
-
+            
     # Impose minimum number of column blocks
     if mincol <= 1.0:
         mincolblocks = int(mincol*nxb)
     else:
-        mincolbocks = int(mincol)
+        mincolblocks = int(mincol)
     tracelist = [tr for tr in tracelist if tr['ncol']>mincolblocks]
     if len(tracelist)==0:
         print('No traces left')
@@ -545,7 +684,7 @@ def trace(im,yestimate=None,yorder=2,sigorder=2,step=50):
         out['tpars'][t] = ypars
         out['sigpars'][t] = sigpars      
         
-    return out,mcat,tcat
+    return out,mcat
 
 def boxcar(im,ytrace=None,imerr=None,off=20,backoff=50):
     """ Boxcar extract the spectrum"""
