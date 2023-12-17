@@ -5,6 +5,7 @@ import numpy as np
 from scipy.special import erf,wofz
 from scipy.optimize import curve_fit, least_squares
 from scipy.signal import find_peaks,argrelextrema,convolve2d
+from scipy.ndimage import median_filter,uniform_filter
 from astropy.io import fits
 from scipy import ndimage
 from scipy.interpolate import interp1d
@@ -487,9 +488,11 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
     y,x = np.arange(ny),np.arange(nx)
     # Median filter in nbin column blocks all in one shot
     medim1 = dln.rebin(im,binsize=[1,nbin],med=True)
+    medim1 = uniform_filter(medim1,[3,1])
     xmed1 = dln.rebin(x,binsize=nbin,med=True)
     # half-steps
     medim2 = dln.rebin(im[:,nbin//2:],binsize=[1,nbin],med=True)
+    medim2 = uniform_filter(medim2,[3,1])
     xmed2 = dln.rebin(x[nbin//2:],binsize=nbin,med=True)
     # Splice them together
     medim = dln.splice(medim1,medim2,axis=1)
@@ -509,7 +512,8 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
         height_thresh = minheight
     else:
         height_thresh = 0.0
-    peaks = ( (medim >= rollyn1) & (medim >= rollyp1) &
+    peaks = ( (((medim >= rollyn1) & (medim > rollyp1)) |
+               ((medim > rollyn1) & (medim >= rollyp1))) &
               (rollyp2 < hratio2*medim) & (rollyn2 < hratio2*medim) &
 	      (medim > height_thresh))
     
@@ -625,7 +629,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
             itrace['heights'].append(medim[yleft[j],xb])
             tracelist.append(itrace)
             if verbose: print(' Adding Y='+str(yleft[j]))
-
+            
     # For each trace, check if it continues at the end, but below the nominal height threshold
     for i in range(len(tracelist)):
         itrace = tracelist[i]
@@ -674,9 +678,9 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
         if x1==0 or x1==(nxb-1): continue  # at edge already
         while (flag==0):
             # Check peaks, heights must be within 30% of the height of the last one
-            doesconnect = peaks[y1-1:y1+2,x1-1] & (np.abs(medim[y1-1:y1+2,x1-1]-medim[y1,x1])/medim[y1,x1] < neifluxratio)
+            doesconnect = peaks[y1-1:y1+2,x1+1] & (np.abs(medim[y1-1:y1+2,x1+1]-medim[y1,x1])/medim[y1,x1] < neifluxratio)
             if np.sum(doesconnect)>0:
-                newx = x1-1
+                newx = x1+1
                 if doesconnect[1]==True:
                     newy = y1
                 elif doesconnect[0]==True:
@@ -702,7 +706,6 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
                 flag = 1      
         # Stuff it back in
         tracelist[i] = itrace
-
         
     # Impose minimum number of column blocks
     if mincol <= 1.0:
