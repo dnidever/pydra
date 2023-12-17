@@ -19,12 +19,44 @@ class Traces():
     """
 
     def __init__(self,data=None):
-        # Input a trace list
-        self._data = data
+        # Input a trace list or an image
+        self._data = None
+        if data is not None:
+            if type(data) is list:
+                self._data = data
+            elif type(data) is numpy.ndarray and data.ndim==2:
+                tlist = findtrace(im)
+                self._data = tlist
+            # Sort them
+            
         self._xmin = None
         self._xmax = None
         self._ymin = None
         self._ymax = None        
+
+    def model(self,x=None,yr=None):
+        """ Make 2D model of the normalized PSFs."""
+        if x is None:
+            xr = [0,int(np.ceil(self.xmax))]
+            x = np.arange(xr[1]-xr[0]+1)+xr[0]
+        if yr is None:
+            yr = [0,int(np.ceil(self.ymax))+10]
+        y = np.arange(yr[1]-yr[0]+1)+yr[0]
+        nx = len(x)
+        ny = len(y)
+        psf = np.zeros((ny,nx),float)
+        for i,t in enumerate(self):
+            sigma1 = np.median(t.sigma)
+            yr1 = [int(np.floor(t.ymin-3*sigma1)),
+                   int(np.ceil(t.ymax+3*sigma1))]
+            xr1 = [int(np.floor(t.xmin)),
+                   int(np.ceil(t.xmax))]
+            x1 = np.arange(xr1[1]-xr1[0]+1)+xr1[0]
+            psf1 = t.model(x1,yr=yr1)
+            slc1 = slice(yr1[0]-yr[0], yr1[1]-yr[0]+1)
+            slc2 = slice(xr1[0]-xr[0], xr1[1]-xr[0]+1)
+            psf[(slc1,slc2)] += psf1
+        return psf
         
     def __len__(self):
         if self._data is None:
@@ -142,7 +174,24 @@ class Trace():
         out['y'] = y
         return out     
 
-    
+    def model(self,x=None,yr=None):
+        """ Return normalized 2D image model."""
+        if x is None:
+            xr = [int(np.ceil(self.xmin)),int(np.floor(self.xmax))]
+            x = np.arange(xr[1]-xr[0]+1)+xr[0]
+        if yr is None:
+            sigma = np.median(self.sigma)
+            yr = [int(np.floor(np.min(self.y)-3*sigma)),
+                  int(np.ceil(np.max(self.y)+3*sigma))]
+        y = np.arange(yr[1]-yr[0]+1)+yr[0]
+        ycen = np.polyval(self._data['tcoef'],x)
+        ysigma = np.polyval(self._data['sigcoef'],x)
+        # subtract minimum y
+        ycenrel = ycen - yr[0]
+        yrel = y-yr[0]
+        psf = gvals(ycenrel,ysigma,yrel)
+        return psf
+            
     def __len__(self):
         if self._data is None:
             return 0
@@ -231,7 +280,7 @@ class Trace():
     def sigma(self):
         if self.hasdata==False:
             return None
-        return np.nanmedian(self._data['gysigma'])
+        return self._data['gysigma']
     
     def fit(self,image,initpos=None):
         """ Fit a trace to data."""
@@ -271,7 +320,23 @@ class Trace():
         plt.plot(out['x'],out['y'],**kwargs)
 
 @njit
-def gvals(x,y):
+def gvals(ycen,ysigma,y):
+    """
+    Calculate Gaussians in list.
+    """
+    nx = len(ycen)
+    ny = len(y)
+    model = np.zeros((ny,nx),float)
+    fac = np.sqrt(2*np.pi)
+    for i in range(nx):
+        #  Gaussian area is A = ht*wid*sqrt(2*pi)
+        # sigma = np.maximum( totflux/(ht0*np.sqrt(2*np.pi))
+        amp = 1/(fac*ysigma[i])
+        model[:,i] = amp*np.exp(-0.5*(y-ycen[i])**2/ysigma[i]**2)
+    return model
+    
+@njit
+def gpars(x,y):
     """
     Simple Gaussian fit to central 5 pixel values.
 
@@ -293,7 +358,7 @@ def gvals(x,y):
     Example
     -------
     
-    pars = gvals(x,y)
+    pars = gpars(x,y)
 
     """
     
@@ -349,7 +414,7 @@ def backvals(backpix):
         lastsigback = sigback
     return medback,sigback
 
-def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.8,
+def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
               neifluxratio=0.3,mincol=0.5,verbose=False):
     """
     Find traces in the image.  The dispersion dimension is assumed
@@ -397,7 +462,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.8,
         raise ValueError('minsigheight must be positive')
     if minheight is not None and minheight < 0:
         raise ValueError('minheight must be positive')    
-    if hratio2 < 0.1 or hratio2 > 0.9:
+    if hratio2 < 0.1 or hratio2 > 0.99:
         raise ValueError('hratio2 must be >0.1 and <0.9')
     if neifluxratio < 0 or neifluxratio > 0.9:
         raise ValueError('neifluxratio must be >0.0 and <0.9')
@@ -472,12 +537,14 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.8,
         height_thresh = medback + minsigheight * sigback
         if verbose: print('height threshold',height_thresh)
         # Impose this on the peak mask
+        #oldpmask = pmask
+        #pmask = (medim*pmask > height_thresh)
+        #ypind,xpind = np.where(pmask)
         oldpmask = pmask
-        pmask = (medim*pmask > height_thresh)
-        ypind,xpind = np.where(pmask)
-        # Create the X-values index
+        ypind,xpind = np.where((medim*pmask > height_thresh))
+        # Create the X-values index of peaks
         xindex = dln.create_index(xpind)
-    
+        
     # Now match up the traces across column blocks
     # Loop over the column blocks and either connect a peak
     # to an existing trace or start a new trace
@@ -519,7 +586,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.8,
                     itrace['heights'].append(medim[ymatch,xb])
                     itrace['ncol'] += 1                    
                     tymatches.append(ymatch)
-                    if verbose: print(' Trace '+str(j)+' matched')
+                    if verbose: print(' Trace '+str(j)+' Y='+str(ymatch)+' matched')
                 else:
                     # Lost
                     if itrace['lost']:
@@ -557,7 +624,86 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.8,
             itrace['xvalues'].append(xmed[xb])                
             itrace['heights'].append(medim[yleft[j],xb])
             tracelist.append(itrace)
-            
+            if verbose: print(' Adding Y='+str(yleft[j]))
+
+    # For each trace, check if it continues at the end, but below the nominal height threshold
+    for i in range(len(tracelist)):
+        itrace = tracelist[i]
+        # Check lower X-values
+        flag = 0
+        nnew = 0
+        x1 = itrace['xbvalues'][0]
+        y1 = itrace['yvalues'][0]
+        if x1==0 or x1==(nxb-1): continue  # at edge already
+        while (flag==0):
+            # Check peaks, heights must be within 30% of the height of the last one
+            doesconnect = peaks[y1-1:y1+2,x1-1] & (np.abs(medim[y1-1:y1+2,x1-1]-medim[y1,x1])/medim[y1,x1] < neifluxratio)
+            if np.sum(doesconnect)>0:
+                newx = x1-1
+                if doesconnect[1]==True:
+                    newy = y1
+                elif doesconnect[0]==True:
+                    newy = y1-1
+                else:
+                    newy = y1+1
+                # Add new column to the trace (to beginning)
+                itrace['yvalues'].insert(0,newy)
+                itrace['xbvalues'].insert(0,newx)
+                itrace['xvalues'].insert(0,xmed[newx])
+                itrace['heights'].insert(0,medim[newy,newx])
+                itrace['ncol'] += 1
+                if verbose:
+                    print(' Trace '+str(i)+' Adding X='+str(newx)+' Y='+str(newy))
+                # Update x1/y1
+                x1 = newx
+                y1 = newy
+                # If at edge, stop                
+                if newx==0 or newx==(nxb-1): flag = 1
+                nnew += 1
+            # No match
+            else:
+                flag = 1
+        # Stuff it back in
+        tracelist[i] = itrace
+        
+        # Check higher X-values
+        flag = 0
+        nnew = 0
+        x1 = itrace['xbvalues'][-1]
+        y1 = itrace['yvalues'][-1]
+        if x1==0 or x1==(nxb-1): continue  # at edge already
+        while (flag==0):
+            # Check peaks, heights must be within 30% of the height of the last one
+            doesconnect = peaks[y1-1:y1+2,x1-1] & (np.abs(medim[y1-1:y1+2,x1-1]-medim[y1,x1])/medim[y1,x1] < neifluxratio)
+            if np.sum(doesconnect)>0:
+                newx = x1-1
+                if doesconnect[1]==True:
+                    newy = y1
+                elif doesconnect[0]==True:
+                    newy = y1-1
+                else:
+                    newy = y1+1
+                # Add new column to the trace
+                itrace['yvalues'].append(newy)
+                itrace['xbvalues'].append(newx)
+                itrace['xvalues'].append(xmed[newx])
+                itrace['heights'].append(medim[newy,newx])
+                itrace['ncol'] += 1
+                if verbose:
+                    print(' Trace '+str(i)+' Adding X='+str(newx)+' Y='+str(newy))
+                # Update x1/y1
+                x1 = newx
+                y1 = newy
+                # If at edge, stop                
+                if newx==0 or newx==(nxb-1): flag = 1
+                nnew += 1
+            # No match
+            else:
+                flag = 1      
+        # Stuff it back in
+        tracelist[i] = itrace
+
+        
     # Impose minimum number of column blocks
     if mincol <= 1.0:
         mincolblocks = int(mincol*nxb)
@@ -579,7 +725,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.8,
             xprofiles[count,:] = np.arange(5)+tr['yvalues'][i]-2
             count += 1
     # Get Gaussian parameters for all profiles at once
-    gpars = gvals(xprofiles,profiles)
+    pars = gpars(xprofiles,profiles)
     # Stuff the Gaussian parameters into the list
     count = 0
     for tr in tracelist:
@@ -587,9 +733,9 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.8,
         tr['gycenter'] = np.zeros(tr['ncol'],float)
         tr['gysigma'] = np.zeros(tr['ncol'],float)
         for i in range(tr['ncol']):
-            tr['gyheight'][i] = gpars[count,0]
-            tr['gycenter'][i] = gpars[count,1]
-            tr['gysigma'][i] = gpars[count,2]
+            tr['gyheight'][i] = pars[count,0]
+            tr['gycenter'][i] = pars[count,1]
+            tr['gysigma'][i] = pars[count,2]
             count += 1
 
     # Fit trace coefficients
@@ -598,6 +744,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.8,
         tr['xmin'] = np.min(tr['xvalues'])-nbin//2
         tr['xmax'] = np.max(tr['xvalues'])+nbin//2
         xt = np.array(tr['xvalues'])
+        # Trace Y-position
         yt = tr['gycenter']
         norder = 3
         coef = np.polyfit(xt,yt,norder)
@@ -617,7 +764,35 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.8,
             std = np.std(resid)
         tr['tcoef'] = coef
         tr['tstd'] = std
-            
+        # Fit Gaussian sigma as well
+        syt = tr['gysigma']
+        norder = 2
+        coef = np.polyfit(xt,syt,norder)
+        resid = syt-np.polyval(coef,xt)
+        std = np.std(resid)
+        # Check if we need to go to 3rd order
+        if std>0.05:
+            norder = 3
+            coef = np.polyfit(xt,syt,norder)
+            resid = syt-np.polyval(coef,xt)
+            std = np.std(resid)
+        # Check if we need to go to 4th order
+        if std>0.05:
+            norder = 4
+            coef = np.polyfit(xt,syt,norder)
+            resid = syt-np.polyval(coef,xt)
+            std = np.std(resid)
+        tr['sigcoef'] = coef
+        tr['sigstd'] = std
+
+    # Add YMED and sort
+    for i in range(len(tracelist)):
+        itrace = tracelist[i]
+        itrace['ymed'] = np.median(itrace['yvalues'])
+        tracelist[i] = itrace
+    # Sort them
+    tracelist.sort(key=lambda t:t['ymed'])
+        
     return tracelist
     
 
