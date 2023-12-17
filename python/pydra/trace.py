@@ -147,6 +147,10 @@ class Traces():
         else:
             raise StopIteration
 
+    def extract(self,im,recenter=False):
+        """ Extract the spectrum from an image."""
+        pass
+        
     def copy(self):
         return Traces(self._data.copy())
         
@@ -167,7 +171,7 @@ class Trace():
         if self._data is None:
             raise ValueError('No trace data yet')
         if x is None:
-            x = np.arange(self._data['xmin'],self._data['xmax'])
+            x = np.arange(np.floor(self._data['xmin']),np.ceil(self._data['xmax'])+1)
         # Get the curve/path
         y = np.polyval(self._data['tcoef'],x)
         out = np.zeros(len(x),dtype=np.dtype([('x',float),('y',float)]))
@@ -313,6 +317,51 @@ class Trace():
         # Determine dispersion axis
         #  the axis with no ambiguities/degeneracies, single-valued
 
+    def polygon(self,nsigma=2.5):
+        """ Return the polygon of the trace area."""
+        tab = self()  # center of fiber, x/y
+        sigma = np.polyval(self._data['sigcoef'],tab['x'])
+        x = np.append(tab['x'],np.flip(tab['x']))
+        y = np.append(tab['y']-nsigma*sigma,np.flip(tab['y']+nsigma*sigma))
+        out = np.zeros(len(x),dtype=np.dtype([('x',float),('y',float)]))
+        out['x'] = x
+        out['y'] = y
+        return out
+
+    def slice(self,nsigma=2.5):
+        """
+        Return a slice object that can be used to get the part of an
+        image needed for this trace.
+        """
+        out = self.polygon(nsigma=nsigma)
+        ymin = int(np.floor(np.min(out['y'])))
+        ymax = int(np.ceil(np.max(out['y'])))
+        xmin = int(np.floor(np.min(out['x'])))
+        xmax = int(np.ceil(np.max(out['x'])))        
+        return slice(ymin,ymax),slice(xmin,xmax)
+
+    def mask(self,nsigma=2.5):
+        """ Return a mask to use to mask an image."""
+        # This should be used with the image return in combination with slice()
+        slcy,slcx = self.slice(nsigma=nsigma)
+        out = self.polygon(nsigma=nsigma)
+        nx = slcx.stop-slcx.start+1
+        ny = slcy.stop-slcy.start+1
+        x = np.arange(0,nx+1)
+        y = np.arange(0,ny+1)
+        xpoly = out['x']-slcx.start
+        ypoly = out['y']-slcy.start
+        xx,yy = np.meshgrid(x,y)
+        ind,cutind = dln.roi_cut(xpoly,ypoly,xx.ravel(),yy.ravel())
+        mm = np.zeros((len(y),len(x)),bool)
+        cutind1,cutind2 = np.unravel_index(cutind,mm.shape)
+        mm[cutind1,cutind2] = True
+        return mm
+    
+    def extract(self,im,recenter=False):
+        """ Extract the spectrum from an image."""
+        pass
+        
     def copy(self):
         return Trace(self._data.copy())
         
@@ -533,6 +582,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
     pmask[ypind,xpind] = True
     
     # Compute height threshold from the background pixels
+    #  need the traces already to do this
     if minheight is None:
         # Grow peak mask by 7 pixels in spatial and 5 in dispersion direction
         #  the rest of the pixels are background
@@ -564,7 +614,26 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
         xind = xpind[ind]
         yind = ypind[ind]
         yind.sort()    # sort y-values
-        xb = xind[0]   # this column block index
+        xb = xind[0]   # this column block index        
+
+        # Deal with neighbors
+        #  we shouldn't have any neighbors in Y
+        if len(ind)>1:
+            diff = dln.slope(np.array(yind))
+            bd, = np.where(diff == 1)
+            if len(bd)>0:
+                torem = []
+                for j in range(len(bd)):
+                    lo = bd[j]
+                    hi = lo+1
+                    if medim[yind[lo],xb] >= medim[yind[hi],xb]:
+                        torem.append(hi)
+                    else:
+                        torem.append(lo)
+                yind = np.delete(yind,np.array(torem))
+                xind = np.delete(xind,np.array(torem))            
+                nind = len(yind)
+
         if verbose: print(i,xb,len(xind),'peaks')
         # Adding traces
         #   Loop through all of the existing traces and try to match them
@@ -791,6 +860,8 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
         tr['sigcoef'] = coef
         tr['sigstd'] = std
 
+    # Should we check for overlap of traces?
+        
     # Add YMED and sort
     for i in range(len(tracelist)):
         itrace = tracelist[i]
