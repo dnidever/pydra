@@ -488,45 +488,48 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
     y,x = np.arange(ny),np.arange(nx)
     # Median filter in nbin column blocks all in one shot
     medim1 = dln.rebin(im,binsize=[1,nbin],med=True)
-    medim1 = uniform_filter(medim1,[3,1])
+    smedim1 = uniform_filter(medim1,[3,1])  # average slightly in Y-direction
     xmed1 = dln.rebin(x,binsize=nbin,med=True)
     # half-steps
     medim2 = dln.rebin(im[:,nbin//2:],binsize=[1,nbin],med=True)
-    medim2 = uniform_filter(medim2,[3,1])
+    smedim2 = uniform_filter(medim2,[3,1])  # average slightly in Y-direction
     xmed2 = dln.rebin(x[nbin//2:],binsize=nbin,med=True)
     # Splice them together
     medim = dln.splice(medim1,medim2,axis=1)
+    smedim = dln.splice(smedim1,smedim2,axis=1)    
     xmed = dln.splice(xmed1,xmed2,axis=0)
     nxb = medim.shape[1]
+    # the smedim is smoothly slightly in Y and will change the profile
+    # use medim to fit the Gaussians
     
     # Compare flux values to neighboring spatial pixels
     #  and two pixels away
     # Shift and mask wrapped values with NaN
-    rollyp2 = dln.roll(medim,2,axis=0)
-    rollyp1 = dln.roll(medim,1,axis=0)
-    rollyn1 = dln.roll(medim,-1,axis=0)
-    rollyn2 = dln.roll(medim,-2,axis=0)
-    rollxp1 = dln.roll(medim,1,axis=1)
-    rollxn1 = dln.roll(medim,-1,axis=1)
+    rollyp2 = dln.roll(smedim,2,axis=0)
+    rollyp1 = dln.roll(smedim,1,axis=0)
+    rollyn1 = dln.roll(smedim,-1,axis=0)
+    rollyn2 = dln.roll(smedim,-2,axis=0)
+    rollxp1 = dln.roll(smedim,1,axis=1)
+    rollxn1 = dln.roll(smedim,-1,axis=1)
     if minheight is not None:
         height_thresh = minheight
     else:
         height_thresh = 0.0
-    peaks = ( (((medim >= rollyn1) & (medim > rollyp1)) |
-               ((medim > rollyn1) & (medim >= rollyp1))) &
-              (rollyp2 < hratio2*medim) & (rollyn2 < hratio2*medim) &
-	      (medim > height_thresh))
+    peaks = ( (((smedim >= rollyn1) & (smedim > rollyp1)) |
+               ((smedim > rollyn1) & (smedim >= rollyp1))) &
+              (rollyp2 < hratio2*smedim) & (rollyn2 < hratio2*smedim) &
+	      (smedim > height_thresh))
     
     # Now require trace heights to be within ~30% of at least one neighboring
     #   median-filtered column block
-    peaksht = ((np.abs(medim[peaks]-rollxp1[peaks])/medim[peaks] < neifluxratio) |
-              (np.abs(medim[peaks]-rollxn1[peaks])/medim[peaks] < neifluxratio))
+    peaksht = ((np.abs(smedim[peaks]-rollxp1[peaks])/smedim[peaks] < neifluxratio) |
+              (np.abs(smedim[peaks]-rollxn1[peaks])/smedim[peaks] < neifluxratio))
     ind = np.where(peaks.ravel())[0][peaksht]
     ypind,xpind = np.unravel_index(ind,peaks.shape)
     xindex = dln.create_index(xpind)
     
     # Boolean mask image for the trace peak pixels
-    pmask = np.zeros(medim.shape,bool)
+    pmask = np.zeros(smedim.shape,bool)
     pmask[ypind,xpind] = True
     
     # Compute height threshold from the background pixels
@@ -535,17 +538,17 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
         #  the rest of the pixels are background
         exclude_mask = convolve2d(pmask,np.ones((7,5)),mode='same')
         backmask = (exclude_mask < 0.5)
-        backpix = medim[backmask]
+        backpix = smedim[backmask]
         medback,sigback = backvals(backpix)
         # Use the final background values to set the height threshold
         height_thresh = medback + minsigheight * sigback
         if verbose: print('height threshold',height_thresh)
         # Impose this on the peak mask
         #oldpmask = pmask
-        #pmask = (medim*pmask > height_thresh)
+        #pmask = (smedim*pmask > height_thresh)
         #ypind,xpind = np.where(pmask)
         oldpmask = pmask
-        ypind,xpind = np.where((medim*pmask > height_thresh))
+        ypind,xpind = np.where((smedim*pmask > height_thresh))
         # Create the X-values index of peaks
         xindex = dln.create_index(xpind)
         
@@ -587,7 +590,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
                     itrace['yvalues'].append(ymatch)
                     itrace['xbvalues'].append(xb)
                     itrace['xvalues'].append(xmed[xb])
-                    itrace['heights'].append(medim[ymatch,xb])
+                    itrace['heights'].append(smedim[ymatch,xb])
                     itrace['ncol'] += 1                    
                     tymatches.append(ymatch)
                     if verbose: print(' Trace '+str(j)+' Y='+str(ymatch)+' matched')
@@ -626,7 +629,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
             itrace['yvalues'].append(yleft[j])
             itrace['xbvalues'].append(xb)
             itrace['xvalues'].append(xmed[xb])                
-            itrace['heights'].append(medim[yleft[j],xb])
+            itrace['heights'].append(smedim[yleft[j],xb])
             tracelist.append(itrace)
             if verbose: print(' Adding Y='+str(yleft[j]))
             
@@ -641,7 +644,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
         if x1==0 or x1==(nxb-1): continue  # at edge already
         while (flag==0):
             # Check peaks, heights must be within 30% of the height of the last one
-            doesconnect = peaks[y1-1:y1+2,x1-1] & (np.abs(medim[y1-1:y1+2,x1-1]-medim[y1,x1])/medim[y1,x1] < neifluxratio)
+            doesconnect = peaks[y1-1:y1+2,x1-1] & (np.abs(smedim[y1-1:y1+2,x1-1]-smedim[y1,x1])/smedim[y1,x1] < neifluxratio)
             if np.sum(doesconnect)>0:
                 newx = x1-1
                 if doesconnect[1]==True:
@@ -654,7 +657,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
                 itrace['yvalues'].insert(0,newy)
                 itrace['xbvalues'].insert(0,newx)
                 itrace['xvalues'].insert(0,xmed[newx])
-                itrace['heights'].insert(0,medim[newy,newx])
+                itrace['heights'].insert(0,smedim[newy,newx])
                 itrace['ncol'] += 1
                 if verbose:
                     print(' Trace '+str(i)+' Adding X='+str(newx)+' Y='+str(newy))
@@ -678,7 +681,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
         if x1==0 or x1==(nxb-1): continue  # at edge already
         while (flag==0):
             # Check peaks, heights must be within 30% of the height of the last one
-            doesconnect = peaks[y1-1:y1+2,x1+1] & (np.abs(medim[y1-1:y1+2,x1+1]-medim[y1,x1])/medim[y1,x1] < neifluxratio)
+            doesconnect = peaks[y1-1:y1+2,x1+1] & (np.abs(smedim[y1-1:y1+2,x1+1]-smedim[y1,x1])/smedim[y1,x1] < neifluxratio)
             if np.sum(doesconnect)>0:
                 newx = x1+1
                 if doesconnect[1]==True:
@@ -691,7 +694,7 @@ def findtrace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
                 itrace['yvalues'].append(newy)
                 itrace['xbvalues'].append(newx)
                 itrace['xvalues'].append(xmed[newx])
-                itrace['heights'].append(medim[newy,newx])
+                itrace['heights'].append(smedim[newy,newx])
                 itrace['ncol'] += 1
                 if verbose:
                     print(' Trace '+str(i)+' Adding X='+str(newx)+' Y='+str(newy))
