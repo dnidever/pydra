@@ -2,6 +2,7 @@
 
 # Imports
 import numpy as np
+import time
 from scipy.special import erf,wofz
 from scipy.optimize import curve_fit, least_squares
 from scipy.signal import find_peaks,argrelextrema,convolve2d
@@ -10,7 +11,8 @@ from astropy.io import fits
 from scipy import ndimage
 from scipy.interpolate import interp1d
 from numba import njit
-from dlnpyutils import utils as dln,robust,mmm
+from dlnpyutils import utils as dln,robust,mmm,coords
+from matplotlib.path import Path
 import matplotlib.pyplot as plt
 #from . import utils,robust,mmm
 
@@ -22,18 +24,30 @@ class Traces():
     def __init__(self,data=None):
         # Input a trace list or an image
         self._data = None
-        if data is not None:
-            if type(data) is list:
-                self._data = data
-            elif type(data) is numpy.ndarray and data.ndim==2:
-                tlist = findtrace(im)
-                self._data = tlist
-            # Sort them
-            
+        self.index = None
         self._xmin = None
         self._xmax = None
         self._ymin = None
         self._ymax = None        
+        # Data input
+        if data is not None:
+            # List of dictionaries or Trace objects
+            if type(data) is list:
+                self._data = data
+            # Image input, find the traces
+            elif type(data) is numpy.ndarray and data.ndim==2:
+                tlist = findtrace(im)
+                self._data = tlist
+            self.index = np.arange(len(self._data))+1
+            # Create the trace objects
+            if isinstance(self._data[0],Trace)==False:
+                data = self._data
+                del self._data
+                self._data = []
+                for i in range(len(data)):
+                    t = Trace(data[i])
+                    t.index = i+1
+                    self._data.append(t)
 
     def model(self,x=None,yr=None):
         """ Make 2D model of the normalized PSFs."""
@@ -124,7 +138,14 @@ class Traces():
         if type(item) is int:
             if item > len(self)-1:
                 raise IndexError('Traces index out of range')
-            return Trace(self._data[item])
+            # Already trace object
+            if isinstance(self._data[item],Trace):
+                tr = self._data[item]
+            # Dictionary, make Trace
+            else:
+                tr = Trace(self._data[item])
+                tr.index = item+1
+            return tr
         # Multiple traces
         elif type(item) is tuple or type(item) is slice:
             index = np.arange(len(self))
@@ -132,7 +153,9 @@ class Traces():
             data = len(index)*[None]
             for i in range(len(index)):
                 data[i] = self._data[index[i]]  # by reference
-            return Traces(data)
+            tr = Traces(data)
+            tr.index = index+1
+            return tr
         else:
             raise ValueError('index not understood')
 
@@ -147,6 +170,75 @@ class Traces():
         else:
             raise StopIteration
 
+    def footprint(self,xr=None,yr=None):
+        """ Return an image that gives the footprints of the traces """
+        # The value will be the trace number
+        if xr is None:
+            xr = [0,int(np.ceil(self.xmax))]
+        if yr is None:
+            yr = [0,int(np.ceil(self.ymax))+10]
+        nx = xr[1]-xr[0]+1
+        ny = yr[1]-yr[0]+1
+        foot = np.zeros((ny,nx),int)
+        for i,t in enumerate(self):
+            slc = t.slice(nsigma=3)
+            mk = t.mask(nsigma=3)
+            foot[slc][mk] = t.index
+        return foot
+
+    def overlap(self,nsigma=1):
+        """ Check overlap of traces within a certain sigma level."""
+        xr = [0,int(np.ceil(self.xmax))]
+        yr = [0,int(np.ceil(self.ymax))+10]
+        nx = xr[1]-xr[0]+1
+        ny = yr[1]-yr[0]+1
+        foot = np.zeros((ny,nx),int)
+        olap = []
+        for i in range(len(self)):
+            tr = self[i]
+            slc = tr.slice(nsigma=nsigma)
+            msk = tr.mask(nsigma=nsigma)
+            if np.sum(foot[slc][msk])>0:
+                ol = ((foot[slc]>0) & msk)
+                tindex = np.unique(foot[slc][ol])
+                if len(tindex)==1: tindex=tindex[0]
+                olap.append((i+1,tindex))
+            foot[slc][msk] = tr.index
+        return olap
+    
+    def neighbors(self,xr=None,yr=None):
+        """ Find overlap of neighbors within 5 sigma."""
+        if xr is None:
+            xr = [0,int(np.ceil(self.xmax))]
+        if yr is None:
+            yr = [0,int(np.ceil(self.ymax))+10]
+        nx = xr[1]-xr[0]+1
+        ny = yr[1]-yr[0]+1
+        foot = np.zeros((ny,nx),int)
+        nolap = np.zeros((ny,nx),int)
+        olap = np.zeros((ny,nx),bool)
+        trace1im = np.zeros((ny,nx),int)
+        trace2im = np.zeros((ny,nx),int)        
+        #olap = np.zeros((ny,nx,2),int)        
+        for i,t in enumerate(self):
+            slc = t.slice(nsigma=5)
+            msk = t.mask(nsigma=5)
+            # Overlap
+            #   [slc] returns a 2D image
+            #   [mk] returns a 1D subset of that
+            if np.sum(foot[slc][msk])>0:
+                ol = ((foot[slc]>0) & msk)
+                olap[slc][ol] = True
+                nolap[slc][ol] += 1
+                trace1im[slc][ol] = np.unique(foot[slc][ol])[0]  # previous value
+                trace2im[slc][ol] = t.index
+                foot[slc][msk] = t.index
+            # No overlap, add this trace index
+            else:
+                foot[slc][mk] = t.index
+        olapindex = np.stack((trace1im,trace2im))
+        return foot,olap,nolap,olapindex
+    
     def extract(self,im,recenter=False):
         """ Extract the spectrum from an image."""
         pass
@@ -165,30 +257,33 @@ class Trace():
     
     def __init__(self,data=None):
         self._data = data
+        self._polygondict = {}
+        self._maskdict = {}
 
-    def __call__(self,x=None):
+    def __call__(self,x=None,step=1):
         """ Return the trace path."""
+        # [N,2] x/y values
         if self._data is None:
             raise ValueError('No trace data yet')
         if x is None:
-            x = np.arange(np.floor(self._data['xmin']),np.ceil(self._data['xmax'])+1)
+            x = np.arange(np.floor(self._data['xmin']),np.ceil(self._data['xmax'])+1,step)
         # Get the curve/path
         y = np.polyval(self._data['tcoef'],x)
-        out = np.zeros(len(x),dtype=np.dtype([('x',float),('y',float)]))
-        out['x'] = x
-        out['y'] = y
+        out = np.zeros((len(x),2))
+        out[:,0] = x
+        out[:,1] = y
         return out     
 
-    def model(self,x=None,yr=None):
+    def model(self,xr=None,yr=None):
         """ Return normalized 2D image model."""
-        if x is None:
+        if xr is None:
             xr = [int(np.ceil(self.xmin)),int(np.floor(self.xmax))]
-            x = np.arange(xr[1]-xr[0]+1)+xr[0]
         if yr is None:
             sigma = np.median(self.sigma)
             yr = [int(np.floor(np.min(self.y)-3*sigma)),
                   int(np.ceil(np.max(self.y)+3*sigma))]
-        y = np.arange(yr[1]-yr[0]+1)+yr[0]
+        x = np.arange(xr[0],xr[1]+1)            
+        y = np.arange(yr[0],yr[1]+1)
         ycen = np.polyval(self._data['tcoef'],x)
         ysigma = np.polyval(self._data['sigcoef'],x)
         # subtract minimum y
@@ -249,7 +344,7 @@ class Trace():
     def data(self):
         if self.hasdata==False:
             return None
-        return self()['y']
+        return self()[:,1]
 
     @property
     def pars(self):
@@ -273,13 +368,13 @@ class Trace():
     def ymin(self):
         if self.hasdata==False:
             return None
-        return np.min(self()['y'])
+        return np.min(self()[:,1])
 
     @property
     def ymax(self):
         if self.hasdata==False:
             return None
-        return np.max(self()['y'])        
+        return np.max(self()[:,1])        
     
     @property
     def sigma(self):
@@ -317,16 +412,24 @@ class Trace():
         # Determine dispersion axis
         #  the axis with no ambiguities/degeneracies, single-valued
 
-    def polygon(self,nsigma=2.5):
+    def polygon(self,nsigma=2.5,step=50):
         """ Return the polygon of the trace area."""
-        tab = self()  # center of fiber, x/y
-        sigma = np.polyval(self._data['sigcoef'],tab['x'])
-        x = np.append(tab['x'],np.flip(tab['x']))
-        y = np.append(tab['y']-nsigma*sigma,np.flip(tab['y']+nsigma*sigma))
-        out = np.zeros(len(x),dtype=np.dtype([('x',float),('y',float)]))
-        out['x'] = x
-        out['y'] = y
-        return out
+        # cache result to make future calls faster
+        key = '{:.1f}-{:d}'.format(nsigma,step)
+        pts = self._polygondict.get(key)
+        if out is None:
+            pts = self.dopolygon(nsigma=nsigma,step=step)
+            self._polygondict[key] = pts
+        return pts
+        
+    def dopolygon(self,nsigma=2.5,step=50):
+        """ Return the polygon of the trace area."""        
+        cpts = self(step=step)  # center of fiber, x/y
+        sigma = np.polyval(self._data['sigcoef'],pts[:,0])
+        x = np.append(cpts[:,0],np.flip(cpts[:,0]))
+        y = np.append(cpts[:,1]-nsigma*sigma,np.flip(cpts[:,1]+nsigma*sigma))
+        pts = np.stack((x,y)).T  # [N,2]
+        return pts
 
     def slice(self,nsigma=2.5):
         """
@@ -342,32 +445,152 @@ class Trace():
 
     def mask(self,nsigma=2.5):
         """ Return a mask to use to mask an image."""
+        # cache result to make future calls faster
+        key = '{:.1f}'.format(nsigma)
+        msk = self._maskdict.get(key)
+        if msk is None:
+            msk = self.domask(nsigma=nsigma)
+            self._maskdict[key] = msk
+        return msk
+        
+    def domask(self,nsigma=2.5):
+        """ Return a mask to use to mask an image."""
         # This should be used with the image return in combination with slice()
         slcy,slcx = self.slice(nsigma=nsigma)
-        out = self.polygon(nsigma=nsigma)
-        nx = slcx.stop-slcx.start+1
-        ny = slcy.stop-slcy.start+1
-        x = np.arange(0,nx+1)
-        y = np.arange(0,ny+1)
-        xpoly = out['x']-slcx.start
-        ypoly = out['y']-slcy.start
+        pts = self.polygon(nsigma=nsigma,step=50)
+        nx = slcx.stop-slcx.start
+        ny = slcy.stop-slcy.start
+        x = np.arange(0,nx)
+        y = np.arange(0,ny)
+        xpoly = pts[:,0]-slcx.start
+        ypoly = pts[:,1]-slcy.start
         xx,yy = np.meshgrid(x,y)
-        ind,cutind = dln.roi_cut(xpoly,ypoly,xx.ravel(),yy.ravel())
-        mm = np.zeros((len(y),len(x)),bool)
-        cutind1,cutind2 = np.unravel_index(cutind,mm.shape)
-        mm[cutind1,cutind2] = True
-        return mm
-    
-    def extract(self,im,recenter=False):
-        """ Extract the spectrum from an image."""
-        pass
+        # find the points that are inside
+        tupVerts = list(zip(xpoly,ypoly))
+        points = np.vstack((xx.ravel(),yy.ravel())).T
+        p = Path(tupVerts) # make a polygon
+        inside = p.contains_points(points)  # this takes some time, 17ms
+        msk = inside.reshape(ny,nx)
+        return msk
+
+    def overlap(self,tr,nsigma=1.0):
+        """ Check if this trace overlaps another one."""
+        if isinstance(tr,Trace)==False:
+            raise ValueError("Input is not a Trace object")
+        pts1 = self.polygon(nsigma=nsigma)
+        pts2 = tr.polygon(nsigma=nsigma)        
+        return coords.doPolygonsOverlap(pts1[:,0],pts1[:,1],pts2[:,0],pts2[:,1])
         
+    def extract(self,image,errim=None,kind='psf',recenter=False,skyfit=False):
+        """
+        Extract the spectrum from an image.
+
+        Parameters
+        ----------
+        image : numpy array
+           The 2D image with the spectrum to extract.
+        errim : numpy array, optional
+           The 2D uncertainty image for "image".
+        kind : str, optional
+          The type of extraction to perform:
+            boxcar, psf, optional, perfectionism
+        recenter : bool, optional
+           Recenter the PSF on the image.  Default is False.
+        skyfit : bool, optional
+           Fit background for each column.  Default is False.
+
+        Returns
+        -------
+        tab : table
+           Table of extracted results.  At minimum has "flux".  The
+             exact columns will depend on the input parameters.
+
+        Example
+        -------
+       
+        tab = extract(im,err,kind='psf')
+
+        """
+        # Get subimage
+        slc = self.slice(nsigma=5)
+        mask = self.mask(nsigma=5)
+        xr = [slc[1].start,slc[1].stop]
+        yr = [slc[0].start,slc[0].stop]
+        im = image[slc]
+        if errim is not None:
+            err = errim[slc]
+        else:
+            err = None
+        psf = self.model(xr=xr,yr=yr)
+        # Recenter
+        if recenter:
+            sh = im.shape
+            xhalf = sh[1]//2
+            medim = np.median(im[:,xhalf-50:xhalf+50],axis=1)
+            medpsf = np.median(psf[:,xhalf-50:xhalf+50],axis=1)
+            import pdb; pdb.set_trace()
+
+        # Do the extraction
+        # -- Boxcar --
+        if kind=='boxcar':
+            boxflux = np.nansum(mask*im,axis=0)
+            if err is not None:
+                boxerr = np.sqrt(np.nansum(mask*err**2,axis=0))
+                dt = [('flux',float),('err',float)]
+                tab = np.zeros(len(boxflux),dtype=np.dtype(dt))
+                tab['flux'] = boxflux
+                tab['err'] = boxerr
+            else:
+                dt = [('flux',float)]
+                tab = np.zeros(len(boxflux),dtype=np.dtype(dt))
+                tab['flux'] = boxflux
+                
+        # -- Optimal extraction --
+        elif kind=='optimal':
+            out = extract_optimal(im,ytrace,imerr=err,verbose=False,
+                                  off=10,backoff=50,smlen=31)
+            flux,fluxer,trace,psf = out
+            dt = [('flux',float),('err',float),('sky',float),('skyerr',float)]
+            tab = np.zeros(len(flux),dtype=np.dtype(dt))
+            tab['flux'] = flux
+            tab['err'] = fluxerr
+            tab['sky'] = sky
+            tab['skyerr'] = skyerr
+            
+        # -- PSF extraction --
+        elif kind=='psf':
+            out = extract.extract_psf(im,psf,err=err,skyfit=skyfit)
+            if skyfit:
+                flux,fluxerr,sky,skyerr = out
+                dt = [('flux',float),('err',float),('sky',float),('skyerr',float)]
+                tab = np.zeros(len(flux),dtype=np.dtype(dt))
+                tab['flux'] = flux
+                tab['err'] = fluxerr
+                tab['sky'] = sky
+                tab['skyerr'] = skyerr
+            else:
+                flux,fluxerr = out
+                dt = [('flux',float),('err',float)]
+                tab = np.zeros(len(flux),dtype=np.dtype(dt))
+                tab['flux'] = flux
+                tab['err'] = fluxerr                
+        # -- Spectro-perfectionism --
+        elif kind=='perfectionism':
+            out = extract_optimal(im,ytrace,imerr=None,verbose=False,off=10,backoff=50,smlen=31)
+            flux,fluxerr,trace,psf = out
+            dt = [('flux',float),('err',float)]
+            tab = np.zeros(len(flux),dtype=np.dtype(dt))
+            tab['flux'] = flux
+            tab['err'] = fluxerr            
+            
+        return tab
+                                      
     def copy(self):
         return Trace(self._data.copy())
         
     def plot(self,**kwargs):
-        out = self()
-        plt.plot(out['x'],out['y'],**kwargs)
+        pts = self()
+        plt.plot(pts[:,0],pts[:,1],**kwargs)
 
 @njit
 def gvals(ycen,ysigma,y):
