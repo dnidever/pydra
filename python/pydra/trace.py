@@ -15,6 +15,7 @@ from dlnpyutils import utils as dln,robust,mmm,coords
 from matplotlib.path import Path
 import matplotlib.pyplot as plt
 #from . import utils,robust,mmm
+from . import extract as xtract
 
 class Traces():
     """
@@ -282,8 +283,8 @@ class Trace():
             sigma = np.median(self.sigma)
             yr = [int(np.floor(np.min(self.y)-3*sigma)),
                   int(np.ceil(np.max(self.y)+3*sigma))]
-        x = np.arange(xr[0],xr[1]+1)            
-        y = np.arange(yr[0],yr[1]+1)
+        x = np.arange(xr[0],xr[1])  # do not include end point
+        y = np.arange(yr[0],yr[1])
         ycen = np.polyval(self._data['tcoef'],x)
         ysigma = np.polyval(self._data['sigcoef'],x)
         # subtract minimum y
@@ -417,7 +418,7 @@ class Trace():
         # cache result to make future calls faster
         key = '{:.1f}-{:d}'.format(nsigma,step)
         pts = self._polygondict.get(key)
-        if out is None:
+        if pts is None:
             pts = self.dopolygon(nsigma=nsigma,step=step)
             self._polygondict[key] = pts
         return pts
@@ -425,7 +426,7 @@ class Trace():
     def dopolygon(self,nsigma=2.5,step=50):
         """ Return the polygon of the trace area."""        
         cpts = self(step=step)  # center of fiber, x/y
-        sigma = np.polyval(self._data['sigcoef'],pts[:,0])
+        sigma = np.polyval(self._data['sigcoef'],cpts[:,0])
         x = np.append(cpts[:,0],np.flip(cpts[:,0]))
         y = np.append(cpts[:,1]-nsigma*sigma,np.flip(cpts[:,1]+nsigma*sigma))
         pts = np.stack((x,y)).T  # [N,2]
@@ -436,11 +437,11 @@ class Trace():
         Return a slice object that can be used to get the part of an
         image needed for this trace.
         """
-        out = self.polygon(nsigma=nsigma)
-        ymin = int(np.floor(np.min(out['y'])))
-        ymax = int(np.ceil(np.max(out['y'])))
-        xmin = int(np.floor(np.min(out['x'])))
-        xmax = int(np.ceil(np.max(out['x'])))        
+        pts = self.polygon(nsigma=nsigma)
+        ymin = int(np.floor(np.min(pts[:,1])))
+        ymax = int(np.ceil(np.max(pts[:,1])))
+        xmin = int(np.floor(np.min(pts[:,0])))
+        xmax = int(np.ceil(np.max(pts[:,0])))        
         return slice(ymin,ymax),slice(xmin,xmax)
 
     def mask(self,nsigma=2.5):
@@ -480,7 +481,14 @@ class Trace():
         pts1 = self.polygon(nsigma=nsigma)
         pts2 = tr.polygon(nsigma=nsigma)        
         return coords.doPolygonsOverlap(pts1[:,0],pts1[:,1],pts2[:,0],pts2[:,1])
-        
+
+    def optimal(self,im):
+        """ Measure the optimal PSF on the image."""
+        pts = self()
+        ytrace = pts[:,1]
+        psf = xtract.optimalpsf(im,ytrace,off=10,backoff=50,smlen=31)
+        return psf
+    
     def extract(self,image,errim=None,kind='psf',recenter=False,skyfit=False):
         """
         Extract the spectrum from an image.
@@ -513,10 +521,11 @@ class Trace():
         """
         # Get subimage
         slc = self.slice(nsigma=5)
-        mask = self.mask(nsigma=5)
+        msk = self.mask(nsigma=5)
         xr = [slc[1].start,slc[1].stop]
         yr = [slc[0].start,slc[0].stop]
-        im = image[slc]
+        im = image[slc].copy()
+        im *= msk  # apply the mask
         if errim is not None:
             err = errim[slc]
         else:
@@ -526,8 +535,22 @@ class Trace():
         if recenter:
             sh = im.shape
             xhalf = sh[1]//2
-            medim = np.median(im[:,xhalf-50:xhalf+50],axis=1)
+            # First fit the PSF peak
             medpsf = np.median(psf[:,xhalf-50:xhalf+50],axis=1)
+            psfgpars,psfgcov = dln.gaussfit(np.arange(len(medpsf)),medpsf,binned=True)
+            # Then fit the image peak
+            medim = np.median(im[:,xhalf-50:xhalf+50],axis=1)
+            initpar = psfgpars
+            pkind = np.argmax(medpsf)
+            initpar[0] = medim[pkind]
+            bounds = [np.zeros(4,float)-np.inf,np.zeros(4,float)+np.inf]
+            bounds[0][0] = 0
+            bounds[0][1] = initpar[1]-2
+            bounds[1][1] = initpar[1]+2            
+            bounds[0][2] = 0
+            imgpars,imgcov = dln.gaussfit(np.arange(len(medim)),medim,initpar=initpar,binned=True,bounds=bounds)
+            # Make new shifted trace object
+            
             import pdb; pdb.set_trace()
 
         # Do the extraction
@@ -547,8 +570,8 @@ class Trace():
                 
         # -- Optimal extraction --
         elif kind=='optimal':
-            out = extract_optimal(im,ytrace,imerr=err,verbose=False,
-                                  off=10,backoff=50,smlen=31)
+            out = xtract.extract_optimal(im,ytrace,imerr=err,verbose=False,
+                                         off=10,backoff=50,smlen=31)
             flux,fluxer,trace,psf = out
             dt = [('flux',float),('err',float),('sky',float),('skyerr',float)]
             tab = np.zeros(len(flux),dtype=np.dtype(dt))
@@ -559,7 +582,7 @@ class Trace():
             
         # -- PSF extraction --
         elif kind=='psf':
-            out = extract.extract_psf(im,psf,err=err,skyfit=skyfit)
+            out = xtract.extract_psf(im,psf,err=err,skyfit=skyfit)
             if skyfit:
                 flux,fluxerr,sky,skyerr = out
                 dt = [('flux',float),('err',float),('sky',float),('skyerr',float)]
@@ -576,7 +599,7 @@ class Trace():
                 tab['err'] = fluxerr                
         # -- Spectro-perfectionism --
         elif kind=='perfectionism':
-            out = extract_optimal(im,ytrace,imerr=None,verbose=False,off=10,backoff=50,smlen=31)
+            out = xtract_optimal(im,ytrace,imerr=None,verbose=False,off=10,backoff=50,smlen=31)
             flux,fluxerr,trace,psf = out
             dt = [('flux',float),('err',float)]
             tab = np.zeros(len(flux),dtype=np.dtype(dt))

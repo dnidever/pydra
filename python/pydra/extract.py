@@ -220,7 +220,111 @@ def optimalpsf(im,ytrace,err=None,off=10,backoff=50,smlen=31):
     psf[(psf<0) | ~np.isfinite(psf)] = 0
 
     return psf
-    
+
+def extract(image,errim=None,kind='psf',recenter=False,skyfit=False):
+    """
+    Extract the spectrum from an image.
+
+    Parameters
+    ----------
+    image : numpy array
+       The 2D image with the spectrum to extract.
+    errim : numpy array, optional
+       The 2D uncertainty image for "image".
+    kind : str, optional
+       The type of extraction to perform:
+         boxcar, psf, optional, perfectionism
+    recenter : bool, optional
+       Recenter the PSF on the image.  Default is False.
+    skyfit : bool, optional
+       Fit background for each column.  Default is False.
+
+    Returns
+    -------
+    tab : table
+       Table of extracted results.  At minimum has "flux".  The
+         exact columns will depend on the input parameters.
+
+    Example
+    -------
+       
+    tab = extract(im,err,kind='psf')
+
+    """
+    # Get subimage
+    slc = self.slice(nsigma=5)
+    mask = self.mask(nsigma=5)
+    xr = [slc[1].start,slc[1].stop]
+    yr = [slc[0].start,slc[0].stop]
+    im = image[slc]
+    if errim is not None:
+        err = errim[slc]
+    else:
+        err = None
+    psf = self.model(xr=xr,yr=yr)
+    # Recenter
+    if recenter:
+        sh = im.shape
+        xhalf = sh[1]//2
+        medim = np.median(im[:,xhalf-50:xhalf+50],axis=1)
+        medpsf = np.median(psf[:,xhalf-50:xhalf+50],axis=1)
+        import pdb; pdb.set_trace()
+
+    # Do the extraction
+    # -- Boxcar --
+    if kind=='boxcar':
+        boxflux = np.nansum(mask*im,axis=0)
+        if err is not None:
+            boxerr = np.sqrt(np.nansum(mask*err**2,axis=0))
+            dt = [('flux',float),('err',float)]
+            tab = np.zeros(len(boxflux),dtype=np.dtype(dt))
+            tab['flux'] = boxflux
+            tab['err'] = boxerr
+        else:
+            dt = [('flux',float)]
+            tab = np.zeros(len(boxflux),dtype=np.dtype(dt))
+            tab['flux'] = boxflux
+                
+    # -- Optimal extraction --
+    elif kind=='optimal':
+        out = extract_optimal(im,ytrace,imerr=err,verbose=False,
+                              off=10,backoff=50,smlen=31)
+        flux,fluxer,trace,psf = out
+        dt = [('flux',float),('err',float),('sky',float),('skyerr',float)]
+        tab = np.zeros(len(flux),dtype=np.dtype(dt))
+        tab['flux'] = flux
+        tab['err'] = fluxerr
+        tab['sky'] = sky
+        tab['skyerr'] = skyerr
+            
+    # -- PSF extraction --
+    elif kind=='psf':
+        out = extract.extract_psf(im,psf,err=err,skyfit=skyfit)
+        if skyfit:
+            flux,fluxerr,sky,skyerr = out
+            dt = [('flux',float),('err',float),('sky',float),('skyerr',float)]
+            tab = np.zeros(len(flux),dtype=np.dtype(dt))
+            tab['flux'] = flux
+            tab['err'] = fluxerr
+            tab['sky'] = sky
+            tab['skyerr'] = skyerr
+        else:
+            flux,fluxerr = out
+            dt = [('flux',float),('err',float)]
+            tab = np.zeros(len(flux),dtype=np.dtype(dt))
+            tab['flux'] = flux
+            tab['err'] = fluxerr                
+    # -- Spectro-perfectionism --
+    elif kind=='perfectionism':
+        out = extract_optimal(im,ytrace,imerr=None,verbose=False,off=10,backoff=50,smlen=31)
+        flux,fluxerr,trace,psf = out
+        dt = [('flux',float),('err',float)]
+        tab = np.zeros(len(flux),dtype=np.dtype(dt))
+        tab['flux'] = flux
+        tab['err'] = fluxerr            
+            
+    return tab
+
     
 def extract_optimal(im,ytrace,imerr=None,verbose=False,off=10,backoff=50,smlen=31):
     """ Extract a spectrum using optimal extraction (Horne 1986)"""
@@ -456,85 +560,6 @@ def fixbadpixels(im,err,psf):
             
     return fixim,fixmask,fixflux,fixfluxerr
 
-def getoffset(input_model,slit):
-
-    im = slit.data
-    
-    ## Get the reference file    
-    step = Extract1dStep()
-    extract_ref = step.get_reference_file(input_model,'extract1d')
-    extract_ref_dict = jextract.open_extract1d_ref(extract_ref, input_model.meta.exposure.type)
-    
-    # Get extraction parameters, from extract.create_extraction()
-    slitname = slit.name
-    sp_order = jextract.get_spectral_order(slit)        
-    meta_source = slit
-    smoothing_length = None
-    use_source_posn = True
-    extract_params = jextract.get_extract_parameters(extract_ref_dict,meta_source,slitname,
-                                                     sp_order,input_model.meta,step.smoothing_length,
-                                                     step.bkg_fit,step.bkg_order,use_source_posn)
-    extract_params['dispaxis'] = extract_ref_dict['apertures'][0]['dispaxis']
-    
-    # Get extraction model, extract.extract_one_slit()
-    # If there is an extract1d reference file (there doesn't have to be), it's in JSON format.
-    extract_model = jextract.ExtractModel(input_model=input_model, slit=slit, **extract_params)
-    ap = jextract.get_aperture(im.shape, extract_model.wcs, extract_params)
-    extract_model.update_extraction_limits(ap)
-        
-    if extract_model.use_source_posn:
-        #if prev_offset == OFFSET_NOT_ASSIGNED_YET:  # Only call this method for the first integration.
-        offset, locn = extract_model.offset_from_offset(input_model, slit)
-    
-        #if offset is not None and locn is not None:
-        #    log.debug(f"Computed source offset={offset:.2f}, source location={locn:.2f}")
-    
-        if not extract_model.use_source_posn:
-            offset = 0.
-        #else:
-        #    offset = prev_offset
-    else:
-        offset = 0.
-    
-    extract_model.position_correction = offset
-    
-    # Add the source position offset to the polynomial coefficients, or shift the reference image
-    # (depending on the type of reference file).
-    extract_model.add_position_correction(im.shape)
-    extract_model.log_extraction_parameters()
-    extract_model.assign_polynomial_limits()
-    
-    # get disp_range, from extract.ExtractModel.extract()
-    if extract_model.dispaxis == jextract.HORIZONTAL:
-        slice0 = int(round(extract_model.xstart))
-        slice1 = int(round(extract_model.xstop)) + 1
-        #x_array = np.arange(slice0, slice1, dtype=np.float64)
-        #y_array = np.empty(x_array.shape, dtype=np.float64)
-        #y_array.fill((extract_model.ystart + extract_model.ystop) / 2.)
-    else:
-        slice0 = int(round(extract_model.ystart))
-        slice1 = int(round(extract_model.ystop)) + 1
-        #y_array = np.arange(slice0, slice1, dtype=np.float64)
-        #x_array = np.empty(y_array.shape, dtype=np.float64)
-        #x_array.fill((extract_model.xstart + extract_model.xstop) / 2.)
-    disp_range = [slice0, slice1]  # Range (slice) of pixel numbers in the dispersion direction.
-          
-    # Get the trace, from extract1d.extract1d()
-    p_src = extract_model.p_src
-    srclim = []                 # this will be a list of lists, like p_src
-    n_srclim = len(p_src)
-    
-    for i in range(n_srclim):
-        lower = p_src[i][0]
-        upper = p_src[i][1]
-        if extract_model.independent_var.startswith("wavelength"):    # OK if 'wavelengths'
-            srclim.append([lower(lambdas), upper(lambdas)])
-        else:
-            # Temporary array for the independent variable.
-            pixels = np.arange(disp_range[0], disp_range[1], dtype=np.float64)
-            srclim.append([lower(pixels), upper(pixels)])
-
-    return offset
 
 def fix_outliers(im,err=None,nsigma=5,nfilter=11,niter=3):
     """ Fix large outlier pixels in an image."""
@@ -569,400 +594,240 @@ def fix_outliers(im,err=None,nsigma=5,nfilter=11,niter=3):
         return outim
         
 
-def extract_slit(input_model,slit,backslit=None,ocalhdu=False,verbose=False,
-                 applyslitcorr=True,plotbase='extract'):
-    """ Extract one slit."""
 
-    print('source_name:',slit.source_name)
-    print('source_id:',slit.source_id)
-    print('slitlet_id:',slit.slitlet_id)
-    print('source ra/dec:',slit.source_ra,slit.source_dec)
-
-    # Clip the X ends
-    #  sometimes there are fully masked columns at the ends
-    goodpix, = np.where((np.sum(np.isfinite(slit.data),axis=0)>0) & (np.sum(slit.err>0,axis=0)>0) &
-                        (np.sum(np.isfinite(slit.wavelength),axis=0)>0))
-    if len(goodpix)==0:
-        print('No good pixels')
-        return None
-    xlo = goodpix[0]
-    xhi = goodpix[-1]
-    xstart = slit.xstart+xlo
-    xsize = xhi-xlo+1
-    if xlo>0:
-        print('Trimming first '+str(xlo)+' fully masked columns')
-    if xhi < (slit.xsize-1):
-        print('Trimming last '+str((slit.xsize-1)-xhi)+' fully masked columns')
-    ystart = slit.ystart
-    ysize = slit.ysize    
-    ystop = ystart+ysize-1
+def extract_pmul(p1lo,p1hi,img,p2):
+    """ Helper function for extract()."""
     
-    # Get the data
-    im = slit.data.copy()[:,xlo:xhi+1].astype(float)
-    err = slit.err.copy()[:,xlo:xhi+1].astype(float)
-    wave = slit.wavelength[:,xlo:xhi+1].astype(float)
-    ny,nx = im.shape
-    bad = (err<=0) | (~np.isfinite(err)) | (~np.isfinite(im))
-    im[bad] = np.nan
-    err[bad] = 1e30
-    # Number of good pixels per column
-    ngood = np.sum(~bad,axis=0)
-    
-    # Extend the wavelength information across the full image
-    #  normally it only covers one section
-    wave0 = wave.copy()
-    y = np.arange(ny)
-    ngoodwave = np.sum(np.isfinite(wave),axis=0)
-    wcoef = np.zeros([nx,2],float)
-    for i in range(nx):
-        if ngoodwave[i]>2:
-            w = wave[:,i]            
-            good = np.isfinite(w)
-            bad = ~np.isfinite(w)
-            wcoef1 = np.polyfit(y[good],w[good],1)
-            wcoef[i,:] = wcoef1
-            wave[bad,i] = np.polyval(wcoef1,y[bad])
-    
-    if np.sum(ngood)==0:
-        print('No data to extract')
-        return None
-
-    # Get the offset
-    offset = getoffset(input_model,slit)
-
-    ## Polynomial coefficients for traces
-    ## y(1024) = 0
-    #coef0 = np.array([ 4.59440169e-06, -1.86120908e-04, -4.83294422e+00])
-    #
-    ## Get peak at X=1024
-    #tot = np.nansum(np.maximum(im,0),axis=1)
-    #yind = np.argmax(tot)
-    ## Trace for this star
-    #coef = coef0.copy()
-    #coef[2] += yind
-    #x = np.arange(nx)
-    #ytrace = np.polyval(coef,x)
-
-    print('offset: ',offset)
-
-    # Use the masked region from the original _cal.fits file to narrow down
-    # where the trace can be
-    #origim = ocalhdu.data
-    #origxstart = ocalhdu.header['xstart']
-    #origxsize = ocalhdu.header['xsize']
-    #origystart = ocalhdu.header['ystart']
-    #origysize = ocalhdu.header['ysize']    
-    #omask = None
-
-    # This returns the trace, but is offset in y by several pixels
-    tr = slit.meta.wcs.get_transform('slit_frame', 'detector')
-    lam = np.linspace(slit.meta.wcsinfo.waverange_start,slit.meta.wcsinfo.waverange_end,5000)
-    xtr,ytr = tr(slit.source_xpos+np.zeros(5000),slit.source_ypos+np.zeros(5000),lam)
-    xtr -= xlo  # correct for any trimming that we did
-    gtr, = np.where((xtr >= 0) & (xtr <= (nx-1)) & (ytr >= 0) & (ytr <= (ny-1)))
-    xtr = xtr[gtr]
-    ytr = ytr[gtr]
-    trcoef = np.polyfit(xtr,ytr,3)    
-    xtrace0 = np.arange(nx)
-    ytrace0 = np.interp(xtrace0,xtr,ytr)
-    
-    # Build Gaussian PSF model based on this trace
-    y = np.arange(ny)
-    yy = y.reshape(-1,1) + np.zeros(nx).reshape(1,-1)
-    gmask = utils.gauss2dbin(yy,np.ones(nx),ytrace0,ytrace0*0+0.5)
-    #gmask = np.sqrt(gmask)  # widen it a bit
-    gmask /= np.sum(gmask,axis=0)  # normalize
-    # Cross-correlation with image +/- 5 pixels
-    fim,ferr = fix_outliers(im,err)  # remove outliers
-    cc = np.zeros(11)
-    ccerr = np.zeros(11)    
-    off = np.arange(11)-5
-    temperr = err.copy()
-    temperr[temperr>1e20] = 0.0  # set masked pixel errors to zero
-    temperr[temperr<=0] = np.nanmedian(temperr[temperr>0])
-    bad = (np.abs(temperr-np.median(temperr)) > 20*dln.mad(temperr))  # get rid of really high errors
-    temperr[bad] = np.median(temperr)
-    for i,sh in enumerate(off):
-        #cc[i] = np.sum(np.maximum(fim,0)*np.roll(gmask,sh,axis=0))
-        cc[i] = np.sum(fim*np.roll(gmask,sh,axis=0))        
-        ccerr[i] = np.sqrt(np.sum((temperr*np.roll(gmask,sh,axis=0))**2))
-    # Find peaks
-    fineoff = np.linspace(off[0],off[-1]+1,1000)
-    finecc = dln.interp(off,cc,fineoff,kind='quadratic')
-    fineccerr = dln.interp(off,ccerr,fineoff,kind='quadratic')    
-    # Find peaks    
-    pkind = findpeaks(finecc)
-    ccsnr = finecc/fineccerr  # this should be the S/N of the entire spectrum
-    # Only keep peaks with S/N>50
-    gdpk, = np.where(ccsnr[pkind]>50)
-    if len(gdpk)==0:
-        print('No good CC peaks with S/N>50')
-        return None
-    pkind = pkind[gdpk]
-    # If multiple peaks, pick the one closest to the initial trace
-    if len(gdpk)>1:
-        print('Multiple CC peaks.  Picking the one closest to the initial trace')
-        neighbor = True
-        clsind = np.argmin(np.abs(fineoff[pkind]))
-        bestind = pkind[clsind]
-        bestoff = fineoff[bestind]
-        peakccsnr = ccsnr[bestind]
-    # Only one good peak
+    lo = np.max([p1lo,p2['lo']])
+    k1 = lo-p1lo
+    l1 = lo-p2['lo']
+    hi = np.min([p1hi,p2['hi']])
+    k2 = hi-p1lo
+    l2 = hi-p2['lo']
+    # No overlap
+    if l1<0 or l2<0 or k1<0 or k2<0:
+        out = np.zeros(2048,float)
+        return out
+    if lo>hi:
+        out = np.zeros(2048,float)
+    img2 = p2['img'].T  # transpose
+    if lo==hi:
+        out = img[:,k1:k2+1]*img2[:,l1:l2+1]
     else:
-        neighbor = False
-        bestind = pkind[0]
-        bestoff = fineoff[bestind]
-        peakccsnr = ccsnr[bestind]
-    print('Best peak CC S/N:',peakccsnr)              
-    print('Cross-correlation Y offset:',bestoff)
-    
-    # Centroid
-    imask = (gmask > 0.001)
-    dyy = yy-(ytrace0.reshape(1,-1) + np.zeros(ny).reshape(-1,1))
-    doff = np.sum(gmask*np.maximum(fim,0)*dyy)/np.sum(gmask*np.maximum(fim,0))
-    print('Centroid Y offset:',doff)
+        out = np.nansum(img[:,k1:k2+1]*img2[:,l1:l2+1],axis=1)
+    if out.ndim==2:
+        out = out.flatten()   # make sure it's 1D
+    return out
 
-    #yoffset = np.mean([bestoff,doff])
-    yoffset = bestoff
-    print('Y offset: ',yoffset)
-    
-    # Offset the Y trace
-    ytrace1 = ytrace0 + yoffset
-    
-    # Do it in chunks of 50 pixels
-    #nchunks = nx//100
-    #doffchunks = np.zeros(nchunks)
-    #for i in range(nchunks):
-    #    x1 = 100*i
-    #    x2 = x1+100
-    #    slc1 = (slice(0,ny),slice(x1,x2))
-    #    doffchunks[i] = np.sum(gmask[slc1]*np.maximum(fim[slc1],0)*dyy[slc1])/np.sum(gmask[slc1]*np.maximum(fim[slc1],0))
-    
-    # I think the trace is at
-    # ny/2+offset at Y=1024
-    #yind = (ny-1)/2+offset
-    
-    # Get the trace
-    x = np.arange(nx)
-    #ttab = tracing(im,err,yind)
-    ttab = tracing(fim,ferr,ytrace1)
-    
-    if len(ttab)==0:
-        print('Problem - no trace found')
-        return None
+@njit
+def solvefibers(x,xvar,ngood,v,b,c,vvar):
+    for j in np.flip(np.arange(0,ngood-1)):
+        x[j] = (v[j]-c[j]*x[j+1])/b[j]
+        xvar[j] = (vvar[j]+c[j]**2*xvar[j+1])/b[j]**2            
+    return x,xvar
 
-    try:
-        if len(ttab)<3:
-            tcoef = np.array([np.median(ttab['y'])])
-            tsigcoef = np.array([np.median(ttab['ysig'])])            
+def epsfmodel(epsf,spec,skip=False,subonly=False,fibers=None,yrange=[0,2048]):
+    """ Create model image using EPSF and best-fit values."""
+    # spec [2048,300], best-fit flux values
+    
+    ntrace = len(epsf)
+    if fibers is None:
+        fibers = np.arange(ntrace)
+    
+    # Create the Model 2D image
+    if yrange is not None:
+        model = np.zeros((2048,yrange[1]-yrange[0]),float)
+        ylo = yrange[0]
+    else:
+        ylo = 0
+        model = np.zeros((2048,2048),float)
+    t = np.copy(spec)
+    bad = (t<=0)
+    if np.sum(bad)>0:
+        t[bad] = 0
+    for k in fibers:
+        nf = 1
+        ns = 0
+        if subonly:
+            junk, = np.where(subonly==k)
+            nf = len(junk)
+        if skip:
+            junk, = np.where(skip==k)
+            ns = len(junk)
+        if nf > 0 and ns==0:
+            p1 = epsf[k]
+            lo = epsf[k]['lo']
+            hi = epsf[k]['hi']
+            img = p1['img'].T
+            rows = np.ones(hi-lo+1,int)
+            fiber = epsf[k]['fiber']
+            model[:,lo-ylo:hi+1-ylo] += img[:,:]*(rows.reshape(-1,1)*t[:,fiber]).T                                    
+    model = model.T
+
+    return model
+
+
+def extractcol(flux,fluxerr,epsf,doback=False,skip=False,subonly=False):
+    """
+    This extracts flux of multiple spectra from a single column using empirical PSFs.
+
+    Extract spectrum under the assumption that a given pixel only contributes
+    to two neighboring traces, leading to a tridiagonal matrix inversion.
+
+    Parameters
+    ----------
+    flux : numpy array
+       The 1D flux column.
+    fluxerr : numpy array
+       The 1D uncertainty column.
+    epsf : list
+       A list with the empirical PSF.
+    doback : boolean, optional
+       Subtract the background.  False by default.
+
+    Returns
+    -------
+    outstr : dict
+        The 1D output structure with FLUX, VAR and MASK.
+    back : numpy array
+        The background
+    model : numpy array
+        The model 2D image
+
+    Example
+    -------
+
+    outstr,back,model = extractcol(image,epsf)
+
+    By J. Holtzman  2011
+      Incorporated into ap2dproc.pro  D.Nidever May 2011
+    """
+    
+    ntrace = len(epsf)
+    fibers = np.array([e['fiber'] for e in epsf])
+    var = np.copy(fluxerr**2)
+        
+    # Initialize output arrays
+    dt = [('flux',float),('err',float),('mask',int),('back',float),('fiber',int)]
+    out = np.zeros(ntrace,dtype=np.dtype(dt))
+    out['fiber'] = fibers
+    
+    # Calculate extraction matrix
+    if doback:
+        nback = 1 
+    else:
+        nback = 0
+    back = 0.0        
+    beta = np.zeros((ntrace+nback),float)
+    betavar = np.zeros((ntrace+nback),float)
+    psftot = np.zeros((ntrace+nback),float)
+    tridiag = np.zeros((3,ntrace+nback),float)
+
+    for k in np.arange(0,ntrace+nback):
+        # Fibers
+        if k <= ntrace-1:
+            # Get EPSF and set bad pixels to NaN
+            p1 = epsf[k]
+            lo = epsf[k]['lo']
+            hi = epsf[k]['hi']
+            bad = (~np.isfinite(flux[lo:hi+1]) | (flux[lo:hi+1] == 0))
+            nbad = np.sum(bad)
+            img = np.copy(p1['img'].T)   # transpose
+            if nbad > 0:
+                img[bad] = np.nan
+            psftot[k] = np.nansum(img,axis=1)
+            beta[k] = np.nansum(flux[lo:hi+1]*img,axis=1)
+            betavar[k] = np.nansum(var[lo:hi+1]*img**2,axis=1)
+        # Background
         else:
-            tcoef = robust.polyfit(ttab['x'],ttab['y'],2)
-            tsigcoef = robust.polyfit(ttab['x'],ttab['ysig'],1)            
-        ytrace = np.polyval(tcoef,x)
-        ysig = np.polyval(tsigcoef,x)
-    except:
-        print('tracing coefficient problem')
-        import pdb; pdb.set_trace()
-        
-    # Create the mask
-    ybin = 3
-    yy = np.arange(ny).reshape(-1,1) + np.zeros(nx).reshape(1,-1)
-    mask = ((yy >= (ytrace-ybin)) & (yy <= (ytrace+ybin)))
+            beta[k] = np.nansum(flux[lo:hi+1],axis=1)
+            betavar[k] = np.nansum(var[lo:hi+1],axis=1)
+            psftot[k] = 1.
+            
+        # First fiber (on the bottom edge)
+        if k==0:
+            ll = 1
+            for l in np.arange(k,k+2):
+                tridiag[ll,k] = extract_pmul(p1['lo'],p1['hi'],img,epsf[l])
+                ll += 1
+        # Last fiber (on top edge)
+        elif k == ntrace-1:
+            ll = 0
+            for l in np.arange(k-1,k+1):
+                tridiag[ll,k] = extract_pmul(p1['lo'],p1['hi'],img,epsf[l])
+                ll += 1
+        # Background terms
+        elif k > ntrace-1:
+            tridiag[1,k] = hi-lo+1
+        # Middle fibers (not first or last)
+        else:
+            ll = 0
+            for l in np.arange(k-1,k+2):
+                tridiag[ll,k] = extract_pmul(p1['lo'],p1['hi'],img,epsf[l])
+                ll += 1
 
-
-    # Get the background from the background image
-    if backslit is not None:
-        bim = backslit.data.copy()
-        backim = np.zeros(im.shape,float)+np.nan
-        bxstart = backslit.xstart
-        bxsize = backslit.xsize
-        bystart = backslit.ystart
-        bysize = backslit.ysize
-        # Find the intersection of their rows        
-        # X-values
-        xs = np.arange(xsize)+xstart
-        backxs = np.arange(bxsize)+bxstart
-        xinter = np.intersect1d(xs,backxs)
-        xinter0,xinter1 = np.min(xinter),np.max(xinter)
-        xlo = xinter0-xstart
-        xhi = xinter1-xstart
-        bxlo = xinter0-bxstart
-        bxhi = xinter1-bxstart
-        # Y-values
-        ys = np.arange(ysize)+ystart
-        backys = np.arange(bysize)+bystart
-        yinter = np.intersect1d(ys,backys)
-        yinter0,yinter1 = np.min(yinter),np.max(yinter)
-        ylo = yinter0-ystart
-        yhi = yinter1-ystart
-        bylo = yinter0-bystart
-        byhi = yinter1-bystart
-        backim[ylo:yhi+1,xlo:xhi+1] = bim[bylo:byhi+1,bxlo:bxhi+1]
-        # Multiply by the mask
-        temp1 = backim.copy()
-        temp1[~mask] = np.nan
-        sky1 = np.nanmedian(temp1,axis=0)
-        diff1 = backim.copy()-sky1.reshape(1,-1)
-        sig1 = dln.mad(diff1[mask])
-        temp2 = backim.copy()
-        temp2[(~mask) | (np.abs(diff1)>3*sig1)] = np.nan
-        sky2 = np.nanmean(temp2,axis=0)
-        sky = np.zeros(ny).reshape(-1,1) + sky2.reshape(1,-1)
+    # Good fibers
+    good, = np.where(psftot > 0.5)
+    ngood = len(good)
+    bad, = np.where(psftot <= 0.5)
+    nbad = len(bad)
+    if nbad > 0:
+        bad0, = np.where(bad>0)
+        nbad0 = len(bad0)
+        if nbad0 > 0:
+            tridiag[2,bad[bad0]-1]=0 
+        bad1, = np.where(bad < ntrace-1)
+        nbad1 = len(bad1)
+        if nbad1 > 0:
+            tridiag[0,bad[bad1]+1] = 0 
+    if ngood>0:
+        a = tridiag[0,good]
+        b = tridiag[1,good]
+        c = tridiag[2,good]
+        v = beta[good]
+        vvar = betavar[good]
+        m = a[1:ngood]/b[0:ngood-1]
+        b[1:] = b[1:]-m*c[0:ngood-1]
+        v[1:] = v[1:]-m*v[0:ngood-1]
+        vvar[1:] = vvar[1:]+m**2*vvar[0:ngood-1]
+        x = np.zeros(ngood,float)
+        xvar = np.zeros(ngood,float)
+        x[ngood-1] = v[ngood-1]/b[ngood-1]
+        xvar[ngood-1] = vvar[ngood-1]/b[ngood-1]**2
+        # Use numba to speed up this slow loop
+        #for j in np.flip(np.arange(0,ngood-1)):
+        #    x[j] = (v[j]-c[j]*x[j+1])/b[j]
+        #    xvar[j] = (vvar[j]+c[j]**2*xvar[j+1])/b[j]**2
+        x,xvar = solvefibers(x,xvar,ngood,v,b,c,vvar)
+        out['flux'][good] = x
+        out['err'][good] = np.sqrt(xvar)
+        # mask the bad pixels
+        out['mask'][good] = 0
+        if nbad > 0:
+            out['mask'][bad] = 1
+            
+    # No good fibers for this column
     else:
-        # Determine a local sky
-        temp1 = im.copy()
-        smask = ((yy >= (ytrace-10)) & (yy <= (ytrace+10)) &
-                 ((yy < (ytrace-2)) | (yy > (ytrace+2))))
-        temp1[~smask] = np.nan
-        sky1 = np.nanmedian(temp1,axis=0)
-        diff1 = im.copy()-sky1.reshape(1,-1)
-        sig1 = dln.mad(diff1[smask])
-        temp2 = im.copy()
-        temp2[(~smask) | (np.abs(diff1)>3*sig1)] = np.nan
-        sky2 = np.nanmean(temp2,axis=0)
-        sky = np.zeros(ny).reshape(-1,1) + sky2.reshape(1,-1)
-    im -= sky   # subtract background
+        out['flux'][:] = 0
+        out['err'][:] = 1e30
+        out['mask'][:] = 1
 
-    # Build Gaussian PSF model
-    y = np.arange(ny)
-    yy = y.reshape(-1,1) + np.zeros(nx).reshape(1,-1)
-    gpsf = utils.gauss2dbin(yy,np.ones(nx),ytrace,ysig)
-    gpsf /= np.sum(gpsf,axis=0)  # normalize
-    # Gaussian PSF extraction
-    gflux,gfluxerr,sky,skyerr = extract_psf(im*mask,gpsf,err,skyfit=True)
+    if doback:
+        back = x[ngood-1]
+        out['back'] = back
 
-    # Number of good pixels per column with good PSF
-    ngood = np.sum((gpsf>0.01)*np.isfinite(im),axis=0)
+    import pdb; pdb.set_trace()
+            
+    # Catch any NaNs (shouldn't be there, but ....)
+    bad = ~np.isfinite(out['flux'])
+    nbad = np.sum(bad)
+    if nbad > 0:
+        out['flux'][bad] = 0.
+        out['err'][bad] = 1e30
+        out['mask'][bad] = 1
 
-    if np.sum(ngood)==0:
-        import pdb; pdb.set_trace()
-        print('no good columns')
-        return None
+    # Create the Model 2D image
+    model = epsfmodel(epsf,out['flux'],subonly=subonly,skip=skip)
+
     
-    # Optimal extraction
-    #  Use the fixed image (with fix_outliers) for the first attempt
-    omask = mask.copy()
-    if neighbor:
-        omask = (gpsf>0.0001)   # use narrower mask (~4-5 pixels) if there is a close neighbor
-    oflux1,ofluxerr1,otrace1,opsf1 = extract_optimal(fim*omask,ytrace,imerr=ferr)
-    if oflux1 is None:
-        return None
-    
-    # Fix bad pixels using the optimal PSF
-    fixim,fixmask,fixflux,fixfluxerr = fixbadpixels(im,err,opsf1)
-
-    # REJECT BAD PIXELS and redo the optimal extraction
-    oflux,ofluxerr,otrace,opsf = extract_optimal(fixim*omask,ytrace,imerr=err)
-
-    # Boxcar extraction of the fixed image
-    boxflux = np.nansum(omask*fixim,axis=0)
-
-    # Optimal extraction looks a little bit better than the boxcar extraction
-    #  lower scatter
-    flux = oflux
-    fluxerr = ofluxerr
-    
-    # Get the wavelengths
-    pmask = (gpsf > 0.01)
-    #wav = np.nansum(wave*pmask,axis=0)/np.sum(pmask,axis=0) * 1e4  # convert to Angstroms
-    #wav = np.nansum(slwave*slgpsf,axis=0)/np.sum(slgpsf*np.isfinite(slwave*slgpsf),axis=0) * 1e4  # convert to Angstroms
-
-    # Save some diagnostic plots    
-    matplotlib.use('Agg')
-    fig = plt.figure(figsize=(12,7))
-    medflux = np.nanmedian(oflux)
-    vmin = -medflux/3.
-    vmax = medflux
-    pl.display(im,xtitle='X',ytitle='Y',vmin=vmin,vmax=vmax,title='DATA - SLIT_ID '+str(slit.source_id))
-    pl.oplot(ytrace,c='red')
-    plt.savefig(plotbase+'_data.png',bbox_inches='tight')
-    pl.display(opsf,xtitle='X',ytitle='Y',vmin=0,vmax=1.2*np.max(opsf),title='Optimal PSF - SLIT_ID '+str(slit.source_id))
-    pl.oplot(ytrace,c='red')
-    plt.savefig(plotbase+'_opsf.png',bbox_inches='tight')
-    # Flux
-    plt.clf()
-    plt.plot(oflux,label='Optimal',linewidth=2)
-    plt.plot(gflux,label='Gaussian')
-    plt.plot(boxflux,label='Boxcar',linestyle='dashed')
-    plt.ylim(-medflux/3.,1.8*medflux)
-    plt.xlabel('X')
-    plt.ylabel('Flux')
-    plt.legend()
-    plt.savefig(plotbase+'_flux.png',bbox_inches='tight')
-    matplotlib.use('MacOSX')
-
-   
-    # Get the wavelengths
-    pmask = (opsf > 0.01)
-    #wav = np.nansum(wave*pmask,axis=0)/np.sum(pmask,axis=0) * 1e4  # convert to Angstroms
-    owav = np.nansum(wave*opsf,axis=0)/np.sum(opsf*np.isfinite(wave*opsf),axis=0) * 1e4  # convert to Angstroms
-
-    # Slit offsets
-    srcxpos = slit.source_xpos
-    srcypos = slit.source_ypos
-    
-    # Get wavelengths using the trace and WCS object
-    xw = x + xlo
-    yw = otrace
-    rr,dd,wcs_wl = slit.meta.wcs(xw,yw)
-    wav = wcs_wl * 1e4
-    if applyslitcorr:
-        print('Applying slit correction (X,Y): (%.2f,%.2f) pixels' % (2*srcxpos,2*srcypos))        
-        xw = x + xlo + 2*srcxpos
-        yw = otrace + 2*srcypos
-        rr,dd,wcs_wl_slitcorr = slit.meta.wcs(xw,yw)
-        wav = wcs_wl_slitcorr * 1e4
-    dwave = np.gradient(wav)
-
-    #import pdb; pdb.set_trace()
-    
-    # Apply slit correction
-    # SLIT correction, srcxpos is source position in slit
-    # the slit is 2 pixels wide
-    #dwave = np.gradient(wav)
-    #import pdb; pdb.set_trace()
-    #if applyslitcorr:
-    #    newwav = wav+2*srcxpos*dwave
-    #    print('Applying slit correction: %.2f pixels' % (2*srcxpos))
-    #else:
-    #    newwav = wav
-        
-    # Add the LSF information
-    #  we are essentially working in a slit-less spectrograph regime
-    #  the LSF is set by the seeing
-    #wsig = ysig*dwave
-    wsig = np.median(ysig)*dwave    
-    gdw, = np.where(np.isfinite(wav) & np.isfinite(wsig))
-    if len(gdw)==0:
-        import pdb; pdb.set_trace()
-    #import pdb; pdb.set_trace()
-    #if len(gdw) > 500:
-    #    wsigcoef = np.polyfit(wav[gdw],wsig[gdw],1)
-    #else:
-    #    wsigcoef = np.polyfit(wav[gdw],wsig[gdw],0)
-    wsigcoef = np.polyfit(wav[gdw],wsig[gdw],1)        
-    print('LSF sigma coefficients:',wsigcoef)
-        
-    # Put it all together
-    sp = Spec1D(flux,err=fluxerr,wave=wav,mask=(fluxerr>1e20),instrument='NIRSpec',
-                  lsfpars=wsigcoef[::-1],lsftype='Gaussian',lsfxtype='wave')
-    sp.date = input_model.meta.date
-    #sp.jd = Time(input_model.meta.date).jd
-    sp.jd = Time(slit.meta.time.barycentric_expmid,format='mjd').jd
-    sp.exptime = slit.meta.exposure.effective_exposure_time
-    sp.bc = slit.meta.wcsinfo.velosys/1e3   # BC in km/s
-    sp.ytrace = ytrace
-    sp.source_name = slit.source_name
-    sp.source_id = slit.source_id
-    sp.slitlet_id = slit.slitlet_id
-    sp.source_ra = slit.source_ra
-    sp.source_dec = slit.source_dec
-    sp.xstart = xstart
-    sp.xsize = xsize
-    sp.ystart = slit.ystart
-    sp.ysize = slit.ysize
-    sp.offset = yoffset
-    sp.tcoef = tcoef
-    sp.tsigcoef = tsigcoef
-    
-    return sp
+    return out,model
