@@ -10,6 +10,7 @@ from astropy.time import Time
 from doppler.spec1d import Spec1D
 from scipy.ndimage import median_filter,generic_filter
 from scipy.signal import argrelextrema
+from numba import njit
 from . import utils
 
 import matplotlib
@@ -328,6 +329,9 @@ def extract(image,errim=None,kind='psf',recenter=False,skyfit=False):
     
 def extract_optimal(im,ytrace,imerr=None,verbose=False,off=10,backoff=50,smlen=31):
     """ Extract a spectrum using optimal extraction (Horne 1986)"""
+    # Make fake error image
+    if imerr is None:
+        imerr = np.sqrt(np.maximum(im*10000/np.max(im),1))
     ny,nx = im.shape
     yest = np.nanmedian(ytrace)
     # Get the subo,age
@@ -361,8 +365,6 @@ def extract_optimal(im,ytrace,imerr=None,verbose=False,off=10,backoff=50,smlen=3
     psf = np.zeros(psf1.shape,float)
     for i in range(nback):
         psf[i,:] = nanmedfilt(psf1[i,:],smlen)
-        #psf[i,:] = dln.medfilt(psf1[i,:],smlen)        
-        #psf[i,:] = utils.gsmooth(psf1[i,:],smlen)        
     psf[(psf<0) | ~np.isfinite(psf)] = 0
     totpsf = np.nansum(psf,axis=0)
     totpsf[(totpsf<=0) | (~np.isfinite(totpsf))] = 1

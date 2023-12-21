@@ -261,13 +261,15 @@ class Trace():
         self._polygondict = {}
         self._maskdict = {}
 
-    def __call__(self,x=None,step=1):
+    def __call__(self,x=None,xr=None,step=1):
         """ Return the trace path."""
         # [N,2] x/y values
         if self._data is None:
             raise ValueError('No trace data yet')
-        if x is None:
+        if x is None and xr is None:
             x = np.arange(np.floor(self._data['xmin']),np.ceil(self._data['xmax'])+1,step)
+        if x is None and xr is not None:
+            x = np.arange(xr[0],xr[1])
         # Get the curve/path
         y = np.polyval(self._data['tcoef'],x)
         out = np.zeros((len(x),2))
@@ -489,7 +491,7 @@ class Trace():
         psf = xtract.optimalpsf(im,ytrace,off=10,backoff=50,smlen=31)
         return psf
     
-    def extract(self,image,errim=None,kind='psf',recenter=False,skyfit=False):
+    def extract(self,image,errim=None,kind='psf',recenter=False,resize=False,skyfit=False):
         """
         Extract the spectrum from an image.
 
@@ -501,9 +503,11 @@ class Trace():
            The 2D uncertainty image for "image".
         kind : str, optional
           The type of extraction to perform:
-            boxcar, psf, optional, perfectionism
+            boxcar, psf, or optimal
         recenter : bool, optional
            Recenter the PSF on the image.  Default is False.
+        resize : bool, optional
+           Resize the Gaussian sigma value of the trace.  Default is False.
         skyfit : bool, optional
            Fit background for each column.  Default is False.
 
@@ -531,8 +535,8 @@ class Trace():
         else:
             err = None
         psf = self.model(xr=xr,yr=yr)
-        # Recenter
-        if recenter:
+        # Recenter/Resize the trace
+        if recenter or resize:
             sh = im.shape
             xhalf = sh[1]//2
             # First fit the PSF peak
@@ -550,15 +554,36 @@ class Trace():
             bounds[0][2] = 0
             imgpars,imgcov = dln.gaussfit(np.arange(len(medim)),medim,initpar=initpar,binned=True,bounds=bounds)
             # Make new shifted trace object
+            tr = self.copy()
+            if recenter:
+                shift = imgpars[1]-psfgpars[1]
+                tr._data['tcoef'][-1] += shift
+            if resize:
+                scale_sigma = imgpars[2]/psfgpars[2]                
+                tr._data['sigcoef'] *= scale_sigma
+            # Get new slice/mask/subimage, etc.
+            slc = tr.slice(nsigma=5)
+            msk = tr.mask(nsigma=5)
+            xr = [slc[1].start,slc[1].stop]
+            yr = [slc[0].start,slc[0].stop]
+            im = image[slc].copy()
+            im *= msk  # apply the mask
+            if errim is not None:
+                err = errim[slc]
+            else:
+                err = None
+            psf = tr.model(xr=xr,yr=yr)
+        # Use original trace
+        else:
+            tr = self
             
-            import pdb; pdb.set_trace()
-
         # Do the extraction
         # -- Boxcar --
         if kind=='boxcar':
-            boxflux = np.nansum(mask*im,axis=0)
+            pmsk = (msk & (psf > 0.005))
+            boxflux = np.nansum(pmsk*im,axis=0)
             if err is not None:
-                boxerr = np.sqrt(np.nansum(mask*err**2,axis=0))
+                boxerr = np.sqrt(np.nansum(msk*err**2,axis=0))
                 dt = [('flux',float),('err',float)]
                 tab = np.zeros(len(boxflux),dtype=np.dtype(dt))
                 tab['flux'] = boxflux
@@ -570,18 +595,24 @@ class Trace():
                 
         # -- Optimal extraction --
         elif kind=='optimal':
-            out = xtract.extract_optimal(im,ytrace,imerr=err,verbose=False,
-                                         off=10,backoff=50,smlen=31)
-            flux,fluxer,trace,psf = out
-            dt = [('flux',float),('err',float),('sky',float),('skyerr',float)]
+            pts = tr(xr=xr)
+            ytrace = pts[:,1]  # absolute 
+            ytrace -= yr[0]    # for subimage
+            pmsk = (msk & (psf > 0.005))
+            im *= pmsk
+            out = xtract.extract_optimal(im,ytrace,imerr=err,verbose=False)
+            flux,fluxerr,trace,opsf = out
+            dt = [('flux',float),('err',float),('trace',float),('sky',float),('skyerr',float)]
             tab = np.zeros(len(flux),dtype=np.dtype(dt))
             tab['flux'] = flux
             tab['err'] = fluxerr
-            tab['sky'] = sky
-            tab['skyerr'] = skyerr
+            tab['trace'] = trace
+            #tab['sky'] = sky
+            #tab['skyerr'] = skyerr
             
         # -- PSF extraction --
         elif kind=='psf':
+            import pdb; pdb.set_trace()
             out = xtract.extract_psf(im,psf,err=err,skyfit=skyfit)
             if skyfit:
                 flux,fluxerr,sky,skyerr = out
@@ -599,7 +630,12 @@ class Trace():
                 tab['err'] = fluxerr                
         # -- Spectro-perfectionism --
         elif kind=='perfectionism':
-            out = xtract_optimal(im,ytrace,imerr=None,verbose=False,off=10,backoff=50,smlen=31)
+            pts = tr(xr=xr)
+            ytrace = pts[:,1]  # absolute 
+            ytrace -= yr[0]    # for subimage
+            pmsk = (msk & (psf > 0.005))
+            im *= pmsk
+            out = xtract.spectroperfectionism(im,ytrace,imerr=None,verbose=False)
             flux,fluxerr,trace,psf = out
             dt = [('flux',float),('err',float)]
             tab = np.zeros(len(flux),dtype=np.dtype(dt))
