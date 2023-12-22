@@ -22,6 +22,18 @@ from dlnpyutils import plotting as pl
 import warnings
 warnings.filterwarnings("ignore", message="OptimizeWarning: Covariance of the parameters could not be estimated")
 
+
+import inspect
+import sys
+
+def recompile_nb_code():
+    this_module = sys.modules[__name__]
+    module_members = inspect.getmembers(this_module)
+
+    for member_name, member in module_members:
+        if hasattr(member, 'recompile') and hasattr(member, 'inspect_llvm'):
+            member.recompile()
+
 def nanmedfilt(x,size,mode='reflect'):
     return generic_filter(x, np.nanmedian, size=size)
 
@@ -596,94 +608,50 @@ def fix_outliers(im,err=None,nsigma=5,nfilter=11,niter=3):
         return outim
         
 
-
-def extract_pmul(p1lo,p1hi,img,p2):
-    """ Helper function for extract()."""
-    
-    lo = np.max([p1lo,p2['lo']])
-    k1 = lo-p1lo
-    l1 = lo-p2['lo']
-    hi = np.min([p1hi,p2['hi']])
-    k2 = hi-p1lo
-    l2 = hi-p2['lo']
-    # No overlap
-    if l1<0 or l2<0 or k1<0 or k2<0:
-        out = np.zeros(2048,float)
-        return out
-    if lo>hi:
-        out = np.zeros(2048,float)
-    img2 = p2['img'].T  # transpose
-    if lo==hi:
-        out = img[:,k1:k2+1]*img2[:,l1:l2+1]
-    else:
-        out = np.nansum(img[:,k1:k2+1]*img2[:,l1:l2+1],axis=1)
-    if out.ndim==2:
-        out = out.flatten()   # make sure it's 1D
-    return out
-
-@njit
-def solvefibers(x,xvar,ngood,v,b,c,vvar):
-    for j in np.flip(np.arange(0,ngood-1)):
-        x[j] = (v[j]-c[j]*x[j+1])/b[j]
-        xvar[j] = (vvar[j]+c[j]**2*xvar[j+1])/b[j]**2            
-    return x,xvar
-
-def epsfmodel(epsf,spec,skip=False,subonly=False,fibers=None,yrange=[0,2048]):
+def epsfmodel(epsf,spec,xcol,yrange=[0,2048]):
     """ Create model image using EPSF and best-fit values."""
-    # spec [2048,300], best-fit flux values
-    
+    # spec [Ntrace], best-fit flux values
     ntrace = len(epsf)
     if fibers is None:
         fibers = np.arange(ntrace)
     
     # Create the Model 2D image
     if yrange is not None:
-        model = np.zeros((2048,yrange[1]-yrange[0]),float)
+        model = np.zeros(yrange[1]-yrange[0],float)
         ylo = yrange[0]
     else:
         ylo = 0
-        model = np.zeros((2048,2048),float)
-    t = np.copy(spec)
-    bad = (t<=0)
+        model = np.zeros(2048,float)
+    flx = np.copy(spec)
+    bad = (flx<=0)
     if np.sum(bad)>0:
-        t[bad] = 0
-    for k in fibers:
-        nf = 1
-        ns = 0
-        if subonly:
-            junk, = np.where(subonly==k)
-            nf = len(junk)
-        if skip:
-            junk, = np.where(skip==k)
-            ns = len(junk)
-        if nf > 0 and ns==0:
-            p1 = epsf[k]
-            lo = epsf[k]['lo']
-            hi = epsf[k]['hi']
-            img = p1['img'].T
-            rows = np.ones(hi-lo+1,int)
-            fiber = epsf[k]['fiber']
-            model[:,lo-ylo:hi+1-ylo] += img[:,:]*(rows.reshape(-1,1)*t[:,fiber]).T                                    
-    model = model.T
-
+        flx[bad] = 0
+    for k in range(len(epsf)):
+        p1 = epsf[k]
+        lo = epsf[k]['ylo']
+        hi = epsf[k]['yhi']
+        xlo = epsf[k]['xlo']
+        xindpsf = xcol-xlo
+        psf = p1['psf'][:,xindpsf]
+        model[lo-ylo:hi+1-ylo] += psf*flx[k]
     return model
 
 
-def extractcol(flux,fluxerr,epsf,doback=False,skip=False,subonly=False):
+def extract(im,err,tr,doback=False):
     """
-    This extracts flux of multiple spectra from a single column using empirical PSFs.
+    This extracts flux of multiple spectra using empirical PSFs.
 
     Extract spectrum under the assumption that a given pixel only contributes
     to two neighboring traces, leading to a tridiagonal matrix inversion.
 
     Parameters
     ----------
-    flux : numpy array
-       The 1D flux column.
-    fluxerr : numpy array
-       The 1D uncertainty column.
-    epsf : list
-       A list with the empirical PSF.
+    im : numpy array
+       The 2D flux column.
+    err : numpy array
+       The 2D uncertainty column.
+    tr : Traces object
+       Traces object.
     doback : boolean, optional
        Subtract the background.  False by default.
 
@@ -699,20 +667,273 @@ def extractcol(flux,fluxerr,epsf,doback=False,skip=False,subonly=False):
     Example
     -------
 
-    outstr,back,model = extractcol(image,epsf)
+    outstr,back,model = extractcol(flux,fluxerr,xcol,tr)
 
     By J. Holtzman  2011
-      Incorporated into ap2dproc.pro  D.Nidever May 2011
+    Translated to Python  D.Nidever May 2011
     """
     
-    ntrace = len(epsf)
-    fibers = np.array([e['fiber'] for e in epsf])
-    var = np.copy(fluxerr**2)
+    var = np.copy(err**2)
+    ny,nx = im.shape
+    
+    # Loop over the columns
+    for i in range(nx):
+        xcol = i
+        flux = im[:,xcol]
+        fluxerr = err[:,xcol]
         
+        # Only keep traces that overlap this column
+        index = []
+        ysize = 0
+        for i in range(len(tr)):
+            t = tr[i]
+            if t.xmin<=xcol and t.xmax>=xcol:
+                index.append(i)
+                ymid = np.polyval(t.coef,xcol)
+                sig = np.polyval(t.sigcoef,xcol)
+                ylo = int(np.floor(ymid-5*sig))
+                yhi = int(np.ceil(ymid+5*sig))
+                ny = yhi-ylo+1
+                ysize = np.maximum(ysize,ny)
+        # Now get the PSF information
+        ylo = np.zeros(len(index),int)
+        yhi = np.zeros(len(index),int)
+        psf = np.zeros((len(index),ysize),float)
+        for i in range(len(index)):
+            t = tr[index[i]]
+            ymid = np.polyval(t.coef,xcol)
+            sig = np.polyval(t.sigcoef,xcol)
+            ylo1 = int(np.floor(ymid-5*sig))
+            yhi1 = int(np.ceil(ymid+5*sig))
+            psf1 = t.model(xr=[xcol,xcol],yr=[ylo1,yhi1])
+            psf1 = psf1[:,0]
+            ylo[i] = ylo1
+            yhi[i] = yhi1
+            psf[i,:len(psf1)] = psf1
+        
+        ntrace = len(index)
+        if ntrace==0:
+            continue
+
+        # Only solve traces that OVERLAP
+
+        import pdb; pdb.set_trace()
+        
+        # Solve for the fluxes
+        spec,specerr,mask,back = _extractcol(flux,fluxerr,ylo,yhi,psf,doback=doback)
+    
+        # Initialize output arrays
+        dt = [('flux',float),('err',float),('mask',int),('back',float),('trace',int)]
+        out = np.zeros(ntrace,dtype=np.dtype(dt))
+        out['flux'] = spec
+        out['err'] = specerr
+        out['mask'] = mask
+        out['back'] = back
+        out['trace'] = np.array(index)+1
+        
+        # Create the Model 2D image
+        model = psfmodelcol(ylo,yhi,psf,spec,back)
+
+
+        import pdb; pdb.set_trace()
+
+        
+    return out,model
+
+
+def psfmodelcol(ylo,yhi,psf,spec,back,yrange=None):
+    """ Create model image using EPSF and best-fit values."""
+    # spec [Ntrace], best-fit flux values
+    ntrace = len(ylo)
+    # Create the Model 2D image
+    if yrange is not None:
+        model = np.zeros(yrange[1]-yrange[0],float)
+        y0 = yrange[0]
+    else:
+        y0 = 0
+        model = np.zeros(np.max(yhi)+5,float)
+    flx = np.copy(spec)
+    bad = (flx<=0)
+    if np.sum(bad)>0:
+        flx[bad] = 0
+    for k in range(ntrace):
+        ylo1 = ylo[k]
+        yhi1 = yhi[k]
+        psf1 = np.copy(psf[k,:yhi1-ylo1])
+        model[ylo1-y0:yhi1-y0] += spec[k]*psf1
+    model += back
+    return model
+
+def extractcol(flux,fluxerr,xcol,tr,doback=False,skip=False,subonly=False):
+    """
+    This extracts flux of multiple spectra from a single column using empirical PSFs.
+
+    Extract spectrum under the assumption that a given pixel only contributes
+    to two neighboring traces, leading to a tridiagonal matrix inversion.
+
+    Parameters
+    ----------
+    flux : numpy array
+       The 1D flux column.
+    fluxerr : numpy array
+       The 1D uncertainty column.
+    xcol : int
+       The X column value.
+    tr : Traces object
+       Traces object.
+    doback : boolean, optional
+       Subtract the background.  False by default.
+
+    Returns
+    -------
+    outstr : dict
+        The 1D output structure with FLUX, ERR, MASK, and BACK.
+    model : numpy array
+        The model 2D image
+
+    Example
+    -------
+
+    outstr,model = extractcol(flux,fluxerr,xcol,tr)
+
+    By J. Holtzman  2011
+    Translated to Python  D.Nidever May 2011
+    """
+    
+    var = np.copy(fluxerr**2)
+    
+    # Only keep traces that overlap this column
+    index = []
+    ysize = 0
+    for i in range(len(tr)):
+        t = tr[i]
+        if t.xmin<=xcol and t.xmax>=xcol:
+            index.append(i)
+            ymid = np.polyval(t.coef,xcol)
+            sig = np.polyval(t.sigcoef,xcol)
+            ylo = int(np.floor(ymid-5*sig))
+            yhi = int(np.ceil(ymid+5*sig))
+            ny = yhi-ylo+1
+            ysize = np.maximum(ysize,ny)
+    # Now get the PSF information
+    ylo = np.zeros(len(index),int)
+    yhi = np.zeros(len(index),int)
+    psf = np.zeros((len(index),ysize),float)
+    for i in range(len(index)):
+        t = tr[index[i]]
+        ymid = np.polyval(t.coef,xcol)
+        sig = np.polyval(t.sigcoef,xcol)
+        ylo1 = int(np.floor(ymid-5*sig))
+        yhi1 = int(np.ceil(ymid+5*sig))
+        psf1 = t.model(xr=[xcol,xcol],yr=[ylo1,yhi1])
+        psf1 = psf1[:,0]
+        ylo[i] = ylo1
+        yhi[i] = yhi1
+        psf[i,:len(psf1)] = psf1
+        
+    ntrace = len(index)
+
+    # Solve for the fluxes
+    spec,specerr,mask,back = _extractcol(flux,fluxerr,ylo,yhi,psf,doback=doback)
+    
     # Initialize output arrays
-    dt = [('flux',float),('err',float),('mask',int),('back',float),('fiber',int)]
+    dt = [('flux',float),('err',float),('mask',int),('back',float),('trace',int)]
     out = np.zeros(ntrace,dtype=np.dtype(dt))
-    out['fiber'] = fibers
+    out['flux'] = spec
+    out['err'] = specerr
+    out['mask'] = mask
+    out['back'] = back
+    out['trace'] = np.array(index)+1
+    
+    # Create the Model 2D image
+    model = psfmodelcol(ylo,yhi,psf,spec,back)
+    
+    return out,model
+
+@njit()
+def extract_pmul(ylo,yhi,psf,n,m):
+    """ Multiply two traces where they overlap. Helper function for _extractcol()."""
+    # n - trace 1 index
+    # m - trace 2 index
+    ylo1 = ylo[n]
+    yhi1 = yhi[n]
+    ylo2 = ylo[m]
+    yhi2 = yhi[m]
+    lo = np.max(np.array([ylo1,ylo2]))
+    k1 = lo-ylo1
+    l1 = lo-ylo2
+    hi = np.min(np.array([yhi1,yhi2]))
+    k2 = hi-ylo1
+    l2 = hi-ylo2
+    # No overlap
+    if l1<0 or l2<0 or k1<0 or k2<0:
+        return 0.0
+    psf1 = psf[n,:yhi[n]-ylo[n]]
+    psf2 = psf[m,:yhi[m]-ylo[m]]
+    if lo==hi:
+        out = psf1[k1:k2]*psf2[l1:l2]
+        out = out[0]
+    else:
+        out = np.nansum(psf1[k1:k2]*psf2[l1:l2])
+    return out
+
+@njit
+def solvefibers(x,xvar,ngood,v,b,c,vvar):
+    for j in np.flip(np.arange(0,ngood-1)):
+        x[j] = (v[j]-c[j]*x[j+1])/b[j]
+        xvar[j] = (vvar[j]+c[j]**2*xvar[j+1])/b[j]**2            
+    return x,xvar
+
+@njit
+def _extractcol(flux,fluxerr,ylo,yhi,psf,doback=False):
+    """
+    This extracts flux of multiple spectra from a single column using empirical PSFs.
+
+    Extract spectrum under the assumption that a given pixel only contributes
+    to two neighboring traces, leading to a tridiagonal matrix inversion.
+
+    Parameters
+    ----------
+    flux : numpy array
+       The 1D flux column.
+    fluxerr : numpy array
+       The 1D uncertainty column.
+    ylo : numpy array
+       Array of Y start indexes.
+    yhi : numpy array
+       Array of Y stop indexes.
+    psf : numpy array
+       2-D array of PSF arrays for each trace.
+    doback : boolean, optional
+       Subtract the background.  False by default.
+
+    Returns
+    -------
+    spec : numpyarray
+        The extracted total flux value per trace.
+    specerr : numpy array
+        Uncertainty in SPEC.
+    mask : numpy array
+        Mask for SPEC.
+    back : numpy array
+        The background value.
+
+    Example
+    -------
+
+    spec,specerr,mask,back = _extractcol(flux,fluxerr,ylo,yhi,psf)
+
+    By J. Holtzman  2011
+    Translated to Python  D.Nidever May 2011
+    """
+
+    nflux = len(flux)
+    var = np.copy(fluxerr**2)
+    ntrace = len(ylo)
+
+    spec = np.zeros(ntrace,float)
+    specerr = np.zeros(ntrace,float)
+    mask = np.zeros(ntrace)
     
     # Calculate extraction matrix
     if doback:
@@ -725,111 +946,120 @@ def extractcol(flux,fluxerr,epsf,doback=False,skip=False,subonly=False):
     psftot = np.zeros((ntrace+nback),float)
     tridiag = np.zeros((3,ntrace+nback),float)
 
+    # loop over all traces and load least squares matrices
+    #   beta[k] = sum_i (y_i * PSF_k)
+    #   alpha[k,l] = sum_i (PSF_k * PSF_l)  but stored as 3 vectors for tridiagonal case
     for k in np.arange(0,ntrace+nback):
         # Fibers
         if k <= ntrace-1:
-            # Get EPSF and set bad pixels to NaN
-            p1 = epsf[k]
-            lo = epsf[k]['lo']
-            hi = epsf[k]['hi']
-            bad = (~np.isfinite(flux[lo:hi+1]) | (flux[lo:hi+1] == 0))
+            # Get PSF and set bad pixels to NaN
+            ylo1 = ylo[k]
+            yhi1 = yhi[k]
+            if yhi1>nflux:
+                yhi1 = nflux
+            psf1 = np.copy(psf[k,:yhi1-ylo1])
+            # Mask bad pixels
+            bad = (~np.isfinite(flux[ylo1:yhi1+1]) | (flux[ylo1:yhi1+1] == 0))
             nbad = np.sum(bad)
-            img = np.copy(p1['img'].T)   # transpose
             if nbad > 0:
-                img[bad] = np.nan
-            psftot[k] = np.nansum(img,axis=1)
-            beta[k] = np.nansum(flux[lo:hi+1]*img,axis=1)
-            betavar[k] = np.nansum(var[lo:hi+1]*img**2,axis=1)
+                psf[bad] = np.nan
+            psftot[k] = np.nansum(psf1)
+            beta[k] = np.nansum(flux[ylo1:yhi1]*psf1)
+            betavar[k] = np.nansum(var[ylo1:yhi1]*psf1**2)
         # Background
         else:
-            beta[k] = np.nansum(flux[lo:hi+1],axis=1)
-            betavar[k] = np.nansum(var[lo:hi+1],axis=1)
+            beta[k] = np.nansum(flux[yhi1:])
+            betavar[k] = np.nansum(var[yhi1:])
             psftot[k] = 1.
             
         # First fiber (on the bottom edge)
         if k==0:
             ll = 1
             for l in np.arange(k,k+2):
-                tridiag[ll,k] = extract_pmul(p1['lo'],p1['hi'],img,epsf[l])
-                ll += 1
+                tridiag[ll,k] = extract_pmul(ylo,yhi,psf,k,l)
+                ll = ll + 1
         # Last fiber (on top edge)
         elif k == ntrace-1:
             ll = 0
             for l in np.arange(k-1,k+1):
-                tridiag[ll,k] = extract_pmul(p1['lo'],p1['hi'],img,epsf[l])
-                ll += 1
+                tridiag[ll,k] = extract_pmul(ylo,yhi,psf,k,l)
+                ll = ll + 1
         # Background terms
         elif k > ntrace-1:
-            tridiag[1,k] = hi-lo+1
+            tridiag[1,k] = len(flux[yhi1:])
         # Middle fibers (not first or last)
         else:
             ll = 0
             for l in np.arange(k-1,k+2):
-                tridiag[ll,k] = extract_pmul(p1['lo'],p1['hi'],img,epsf[l])
-                ll += 1
+                tridiag[ll,k] = extract_pmul(ylo,yhi,psf,k,l)
+                ll = ll + 1
 
     # Good fibers
-    good, = np.where(psftot > 0.5)
+    good, = np.where(psftot > 0.1)
     ngood = len(good)
-    bad, = np.where(psftot <= 0.5)
+    bad, = np.where(psftot <= 0.1)
     nbad = len(bad)
     if nbad > 0:
         bad0, = np.where(bad>0)
         nbad0 = len(bad0)
         if nbad0 > 0:
-            tridiag[2,bad[bad0]-1]=0 
+            temp = tridiag[2,:]
+            temp[bad[bad0]-1] = 0
+            tridiag[2,:] = temp
         bad1, = np.where(bad < ntrace-1)
         nbad1 = len(bad1)
         if nbad1 > 0:
-            tridiag[0,bad[bad1]+1] = 0 
+            temp = tridiag[0,:]
+            temp[bad[bad1]+1] = 0
+            tridiag[0,:] = temp
     if ngood>0:
-        a = tridiag[0,good]
-        b = tridiag[1,good]
-        c = tridiag[2,good]
+        a = tridiag[0,:][good]
+        b = tridiag[1,:][good]
+        c = tridiag[2,:][good]
         v = beta[good]
         vvar = betavar[good]
-        m = a[1:ngood]/b[0:ngood-1]
-        b[1:] = b[1:]-m*c[0:ngood-1]
-        v[1:] = v[1:]-m*v[0:ngood-1]
-        vvar[1:] = vvar[1:]+m**2*vvar[0:ngood-1]
+        m = a[1:ngood]/b[:ngood-1]
+        b[1:] = b[1:]-m*c[:ngood-1]
+        v[1:] = v[1:]-m*v[:ngood-1]
+        vvar[1:] = vvar[1:]+m**2*vvar[:ngood-1]
         x = np.zeros(ngood,float)
         xvar = np.zeros(ngood,float)
         x[ngood-1] = v[ngood-1]/b[ngood-1]
         xvar[ngood-1] = vvar[ngood-1]/b[ngood-1]**2
-        # Use numba to speed up this slow loop
-        #for j in np.flip(np.arange(0,ngood-1)):
-        #    x[j] = (v[j]-c[j]*x[j+1])/b[j]
-        #    xvar[j] = (vvar[j]+c[j]**2*xvar[j+1])/b[j]**2
         x,xvar = solvefibers(x,xvar,ngood,v,b,c,vvar)
-        out['flux'][good] = x
-        out['err'][good] = np.sqrt(xvar)
-        # mask the bad pixels
-        out['mask'][good] = 0
-        if nbad > 0:
-            out['mask'][bad] = 1
+        
+        if doback:
+            spec[good[:-1]] = x[:-1]    # last one is the background
+            specerr[good[:-1]] = np.sqrt(xvar[:-1])
+            # mask the bad pixels
+            mask[good[:-1]] = 0
+            if nbad > 0:
+                mask[bad] = 1
+        else:
+            spec[good] = x
+            specerr[good] = np.sqrt(xvar)
+            # mask the bad pixels
+            mask[good] = 0
+            if nbad > 0:
+                mask[bad] = 1
             
     # No good fibers for this column
     else:
-        out['flux'][:] = 0
-        out['err'][:] = 1e30
-        out['mask'][:] = 1
+        spec[:] = 0.0
+        specerr[:] = 1e30
+        mask[:] = 1
 
     if doback:
         back = x[ngood-1]
-        out['back'] = back
-
-    import pdb; pdb.set_trace()
+    else:
+        back = 0.0
             
     # Catch any NaNs (shouldn't be there, but ....)
-    bad = ~np.isfinite(out['flux'])
+    bad = ~np.isfinite(spec)
     nbad = np.sum(bad)
     if nbad > 0:
-        out['flux'][bad] = 0.
-        out['err'][bad] = 1e30
-        out['mask'][bad] = 1
-
-    # Create the Model 2D image
-    model = epsfmodel(epsf,out['flux'],subonly=subonly,skip=skip)
-
+        spec[bad] = 0.
+        specerr[bad] = 1e30
+        mask[bad] = 1
     
-    return out,model
+    return spec,specerr,mask,back
