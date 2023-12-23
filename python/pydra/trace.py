@@ -663,7 +663,15 @@ class Trace():
                                       
     def copy(self):
         return Trace(self._data.copy())
-        
+
+    def read(self,filename):
+        """ Read from a file."""
+        pass
+
+    def save(self,filename):
+        """ Write to a file."""
+        pass
+    
     def plot(self,**kwargs):
         pts = self()
         plt.plot(pts[:,0],pts[:,1],**kwargs)
@@ -707,11 +715,69 @@ def gvals(ycen,ysigma,y):
         amp = 1/(fac*ysigma[i])
         model[:,i] = amp*np.exp(-0.5*(y-ycen[i])**2/ysigma[i]**2)
     return model
+
+@njit
+def gpars1(x,y):
+    """
+    Simple Gaussian fit to central 5 pixel values.
+
+    Parameters
+    ----------
+    x : numpy array
+       Numpy array of x-values.
+    y : numpy array
+       Numpy array of flux values.  Can be a single or
+       mulitple profiles.  If mulitple profiles, the dimensions
+       should be [Nprofiles,5].
+
+    Returns
+    -------
+    pars : numpy array
+       Gaussian parameters [height, center, sigma].  If multiple
+       profiles are input, then the output dimensions are [Nprofiles,3].
+
+    Example
+    -------
+    
+    pars = gpars1(x,y)
+
+    """
+    pars = np.zeros(3,float)
+    nx = len(y)
+    nhalf = nx//2
+    gd = (np.isfinite(y) & (y>0))
+    #if np.sum(gd)<5:
+    x = x[gd]
+    y = y[gd]
+    totflux = np.sum(y)
+    ht0 = y[nhalf]
+    if np.isfinite(ht0)==False:
+        ht0 = np.max(y)
+    # Use flux-weighted moment to get center
+    cen1 = np.sum(y*x)/totflux
+    #  Gaussian area is A = ht*wid*sqrt(2*pi)
+    sigma1 = np.maximum( totflux/(ht0*np.sqrt(2*np.pi)) , 0.01)
+    # Use linear-least squares to calculate height and sigma
+    psf = np.exp(-0.5*(x-cen1)**2/sigma1**2)          # normalized Gaussian
+    wtht = np.sum(y*psf)/np.sum(psf*psf)          # linear least squares
+
+    # Directly solve for the parameters using ln(y)
+    lny = np.log(y)
+    quadcoef = quadratic_coefficients(x-cen1,lny)
+    # a = -1/(2*sigma**2)   ->   sigma=sqrt(-1/(2*a))
+    # b = x0/sigma**2       ->   x0=b*sigma**2
+    # c = -x0**2/(2*sigma**2) + lnA  ->  A=exp(c + x0**2/(2*sigma**2))
+    sigma = np.sqrt(-1/(2*quadcoef[0]))
+    x0 = quadcoef[1]*sigma**2
+    height = np.exp(quadcoef[2]+x0**2/(2*sigma**2))
+    
+    pars[:] = [height,cen1+x0,sigma] 
+    return pars
     
 @njit
 def gpars(x,y):
     """
-    Simple Gaussian fit to central 5 pixel values.
+    Simple Gaussian fit to central pixel values.
 
     Parameters
     ----------
@@ -745,34 +811,25 @@ def gpars(x,y):
     # Loop over profiles
     pars = np.zeros((nprofiles,3),float)
     for i in range(nprofiles):
-        x1 = x[i,:]
-        y1 = y[i,:]
+        # First try the central 5 pixels first        
+        x1 = x[i,2:7]
+        y1 = y[i,2:7]
         gd = (np.isfinite(y1) & (y1>0))
-        #if np.sum(gd)<5:
-        x1 = x1[gd]
-        y1 = y1[gd]
-        totflux = np.sum(y1)
-        ht0 = y[i,nhalf]
-        if np.isfinite(ht0)==False:
-            ht0 = np.max(y1)
-        # Use flux-weighted moment to get center
-        cen1 = np.sum(y1*x1)/totflux
-        #  Gaussian area is A = ht*wid*sqrt(2*pi)
-        sigma1 = np.maximum( totflux/(ht0*np.sqrt(2*np.pi)) , 0.01)
-        # Use linear-least squares to calculate height and sigma
-        psf = np.exp(-0.5*(x1-cen1)**2/sigma1**2)          # normalized Gaussian
-        wtht = np.sum(y1*psf)/np.sum(psf*psf)          # linear least squares
-
-        # Directly solve for the parameters using ln(y)
-        lny1 = np.log(y1)
-        quadcoef = quadratic_coefficients(x1-cen1,lny1)
-        # a = -1/(2*sigma**2)   ->   sigma=sqrt(-1/(2*a))
-        # b = x0/sigma**2       ->   x0=b*sigma**2
-        # c = -x0**2/(2*sigma**2) + lnA  ->  A=exp(c + x0**2/(2*sigma**2))
-        sigma = np.sqrt(-1/(2*quadcoef[0]))
-        x0 = quadcoef[1]*sigma**2
-        height = np.exp(quadcoef[2]+x0**2/(2*sigma**2))
-        pars[i,:] = [height,cen1+x0,sigma]        
+        if np.sum(gd)<5:
+            x1 = x1[gd]
+            y1 = y1[gd]
+        pars1 = gpars1(x1,y1)
+        # If sigma is too high, then expand to include more points     
+        if pars1[2]>2:
+            x1 = x[i,:]
+            y1 = y[i,:]
+            gd = (np.isfinite(y1) & (y1>0))
+            if np.sum(gd)<9:
+                x1 = x1[gd]
+                y1 = y1[gd]
+            pars1 = gpars1(x1,y1)            
+        # Put results in big array
+        pars[i,:] = pars1
         
     return pars
 
@@ -1124,13 +1181,26 @@ def trace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
     
     # Calculate Gaussian parameters
     nprofiles = np.sum([tr['ncol'] for tr in tracelist])
-    profiles = np.zeros((nprofiles,5),float)
-    xprofiles = np.zeros((nprofiles,5),int)
+    profiles = np.zeros((nprofiles,9),float) + np.nan  # all bad to start
+    xprofiles = np.zeros((nprofiles,9),int)
     count = 0
     for tr in tracelist:
         for i in range(tr['ncol']):
-            profiles[count,:] = medim[tr['yvalues'][i]-2:tr['yvalues'][i]+3,tr['xbvalues'][i]]
-            xprofiles[count,:] = np.arange(5)+tr['yvalues'][i]-2
+            if tr['yvalues'][i]<4:        # at bottom edge
+                lo = 4-tr['yvalues'][i]
+                yp = np.zeros(9,float)+np.nan
+                yp[lo:] = medim[:tr['yvalues'][i]+5,tr['xbvalues'][i]]                
+            elif tr['yvalues'][i]>(ny-5):   # at top edge
+                hi = 9-(ny-tr['yvalues'][i])+1
+                yp = np.zeros(9,float)+np.nan
+                yp[:hi] = medim[tr['yvalues'][i]-4:,tr['xbvalues'][i]]
+            else:
+                lo = tr['yvalues'][i]-4
+                hi = tr['yvalues'][i]+5
+                yp = medim[lo:hi,tr['xbvalues'][i]]
+            profiles[count,:] = yp
+            xp = np.arange(9)+tr['yvalues'][i]-4            
+            xprofiles[count,:] = xp
             count += 1
     # Get Gaussian parameters for all profiles at once
     pars = gpars(xprofiles,profiles)
