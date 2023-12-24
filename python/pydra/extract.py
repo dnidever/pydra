@@ -809,11 +809,13 @@ def _solvecol(flux,fluxerr,psf,doback=doback):
     A = np.hstack((A,np.ones((psf.shape[0],1),float)))
     B = flux.copy()
     # when solving it this way, we need to multiply A and b by sqrt(weight)
+    weight = 1/fluxerr**2
     wtsqr = 1/fluxerr
     bad = ((~np.isfinite(flux)) | (flux<0) | (~np.isfinite(fluxerr)))
     if np.sum(bad)>0:
         B[bad] = 0
         wtsqr[bad] = 0
+        # we could also remove "bad" elements from flux/fluxerr/weight/psf
     Aw = A*wtsqr.reshape(-1,1)
     Bw = (B*wtsqr).reshape(-1,1)
     x,resid,rank,s = np.linalg.lstsq(Aw, Bw)
@@ -823,7 +825,7 @@ def _solvecol(flux,fluxerr,psf,doback=doback):
     # Get uncertainties
     # https://en.wikipedia.org/wiki/Weighted_least_squares
     # Parameter errors and correlation
-    xcov = np.linalg.inv(A.T @ Aw)
+    xcov = np.linalg.inv(A.T @ (A*weight.reshape(-1,1)))
     xerr = np.sqrt(np.diag(xcov))
 
     # the sklearn code uses the sqrt() of the weights
