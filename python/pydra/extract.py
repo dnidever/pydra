@@ -765,9 +765,9 @@ def psfmodelcol(ylo,yhi,psf,spec,back,yrange=None):
     model += back
     return model
 
-def _solvecol(flux,fluxerr,psf,doback=doback):
+def _solvecol(flux,fluxerr,psf,doback=True):
     """
-    Solve single columne with full lineast least squares.
+    Solve single column with full lineast least squares.
 
     Parameters
     ----------
@@ -778,7 +778,7 @@ def _solvecol(flux,fluxerr,psf,doback=doback):
     psf : numpy array
        PSF model for each trace for the full data length.
     doback : boolean, optional
-       Subtract the background.  False by default.
+       Subtract the background.  True by default.
 
     Returns
     -------
@@ -797,31 +797,30 @@ def _solvecol(flux,fluxerr,psf,doback=doback):
     spec,specerr,back,backerr = _solvecol(flux,fluxerr,psf,doback=True)
 
     """
-    # Add constant
-    if doback:
-        psf = np.hstack((psf,np.ones((psf.shape[0],1),float)))
 
     # Set WEIGHT of BAD data to 0
+    # we could also remove "bad" elements from flux/fluxerr/weight/psf
         
     # Solve it
     #  use weighted linear least squares
     A = psf
-    A = np.hstack((A,np.ones((psf.shape[0],1),float)))
+    if doback:  # add constant
+        A = np.hstack((A,np.ones((psf.shape[0],1),float)))
     B = flux.copy()
-    # when solving it this way, we need to multiply A and b by sqrt(weight)
+    # When solving it with lstsq(), we need to rescale A and B by sqrt(weight)
     weight = 1/fluxerr**2
     wtsqr = 1/fluxerr
     bad = ((~np.isfinite(flux)) | (flux<0) | (~np.isfinite(fluxerr)))
     if np.sum(bad)>0:
         B[bad] = 0
         wtsqr[bad] = 0
-        # we could also remove "bad" elements from flux/fluxerr/weight/psf
     Aw = A*wtsqr.reshape(-1,1)
     Bw = (B*wtsqr).reshape(-1,1)
     x,resid,rank,s = np.linalg.lstsq(Aw, Bw)
-    model1 = np.dot(A,x[:,0])
-    chisq1 = np.sum((flux-model1)**2/fluxerr**2)
+    model = np.dot(A,x[:,0])
+    chisq = np.sum((flux-model1)**2/fluxerr**2)
     # this is ~6x faster than sklearn
+    
     # Get uncertainties
     # https://en.wikipedia.org/wiki/Weighted_least_squares
     # Parameter errors and correlation
@@ -831,42 +830,17 @@ def _solvecol(flux,fluxerr,psf,doback=doback):
     # the sklearn code uses the sqrt() of the weights
     # it uses scipy.linalg.lstsq() under the hood
     
-    # sklearn weighted linear regression
-    # it automatically fits for the background, unless reg.fit_intercept = False
-    # accepts sparse matrices
-    # by default is copies the A matrix
-    A = psf
-    B = flux
-    weight = 1/fluxerr**2
-    bad = ((~np.isfinite(flux)) | (flux<0) | (~np.isfinite(fluxerr)))
-    if np.sum(bad)>0:
-        B[bad] = 0
-        weight[bad] = 0
-    reg = LinearRegression(fit_intercept=doback).fit(A,B,weight)
-    x = reg.coef_            # final values
-    if doback:
-        back = reg.intercept_    # constant/background term
-    model2 = reg.predict(A)
-    chisq2 = np.sum((flux-model2)**2/fluxerr**2)    
-    A = psf
-    if doback:
-        A = np.hstack((A,np.ones((psf.shape[0],1),float)))
-    Aw = A*weight.reshape(-1,1)
-    xcov = np.linalg.inv(A.T @ Aw)
-    xerr = np.sqrt(np.diag(xcov))
-
-
-    # How about the uncertainties??
-    
     # Background
     if doback:
         spec = x[:-1]
+        specerr = xerr[:-1]
         back = x[-1]
+        backerr = xerr[-1]
+        return spec,specerr,back,backerr        
     else:
         spec = x
-        back = 0.0
-    
-    return spec,specerr,back,backerr
+        specerr = xerr
+        return spec,specerr
 
 def extractcol(flux,fluxerr,xcol,tr,doback=False,method='lstsq'):
     """
@@ -950,7 +924,8 @@ def extractcol(flux,fluxerr,xcol,tr,doback=False,method='lstsq'):
 
     # Solve for the fluxes
     if method=='lstsq':
-        spec,specerr,mask,back = _solvecol(flux,fluxerr,psf,doback=doback)
+        # mask??
+        spec,specerr,back,backerr = _solvecol(flux,fluxerr,psf,doback=doback)
     else:
         spec,specerr,mask,back = _extractcol(flux,fluxerr,ylo,yhi,psf,doback=doback)
     
