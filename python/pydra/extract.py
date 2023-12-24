@@ -10,6 +10,7 @@ from astropy.time import Time
 from doppler.spec1d import Spec1D
 from scipy.ndimage import median_filter,generic_filter
 from scipy.signal import argrelextrema
+from sklearn.linear_model import LinearRegression
 from numba import njit
 from . import utils
 
@@ -764,7 +765,108 @@ def psfmodelcol(ylo,yhi,psf,spec,back,yrange=None):
     model += back
     return model
 
-def extractcol(flux,fluxerr,xcol,tr,doback=False,skip=False,subonly=False):
+def _solvecol(flux,fluxerr,psf,doback=doback):
+    """
+    Solve single columne with full lineast least squares.
+
+    Parameters
+    ----------
+    flux : numpy array
+       The 1D flux column.
+    fluxerr : numpy array
+       The 1D uncertainty column.
+    psf : numpy array
+       PSF model for each trace for the full data length.
+    doback : boolean, optional
+       Subtract the background.  False by default.
+
+    Returns
+    -------
+    spec : numpy array
+       Final flux values.
+    specerr : numpy array
+       Uncertainties in spec.
+    back : float
+       Background value.
+    backerr : float
+       Uncertainty in background value.
+
+    Example
+    -------
+
+    spec,specerr,back,backerr = _solvecol(flux,fluxerr,psf,doback=True)
+
+    """
+    # Add constant
+    if doback:
+        psf = np.hstack((psf,np.ones((psf.shape[0],1),float)))
+
+    # Set WEIGHT of BAD data to 0
+        
+    # Solve it
+    #  use weighted linear least squares
+    A = psf
+    A = np.hstack((A,np.ones((psf.shape[0],1),float)))
+    B = flux.copy()
+    # when solving it this way, we need to multiply A and b by sqrt(weight)
+    wtsqr = 1/fluxerr
+    bad = ((~np.isfinite(flux)) | (flux<0) | (~np.isfinite(fluxerr)))
+    if np.sum(bad)>0:
+        B[bad] = 0
+        wtsqr[bad] = 0
+    Aw = A*wtsqr.reshape(-1,1)
+    Bw = (B*wtsqr).reshape(-1,1)
+    x,resid,rank,s = np.linalg.lstsq(Aw, Bw)
+    model1 = np.dot(A,x[:,0])
+    chisq1 = np.sum((flux-model1)**2/fluxerr**2)
+    # this is ~6x faster than sklearn
+    # Get uncertainties
+    # https://en.wikipedia.org/wiki/Weighted_least_squares
+    # Parameter errors and correlation
+    xcov = np.linalg.inv(A.T @ Aw)
+    xerr = np.sqrt(np.diag(xcov))
+
+    # the sklearn code uses the sqrt() of the weights
+    # it uses scipy.linalg.lstsq() under the hood
+    
+    # sklearn weighted linear regression
+    # it automatically fits for the background, unless reg.fit_intercept = False
+    # accepts sparse matrices
+    # by default is copies the A matrix
+    A = psf
+    B = flux
+    weight = 1/fluxerr**2
+    bad = ((~np.isfinite(flux)) | (flux<0) | (~np.isfinite(fluxerr)))
+    if np.sum(bad)>0:
+        B[bad] = 0
+        weight[bad] = 0
+    reg = LinearRegression(fit_intercept=doback).fit(A,B,weight)
+    x = reg.coef_            # final values
+    if doback:
+        back = reg.intercept_    # constant/background term
+    model2 = reg.predict(A)
+    chisq2 = np.sum((flux-model2)**2/fluxerr**2)    
+    A = psf
+    if doback:
+        A = np.hstack((A,np.ones((psf.shape[0],1),float)))
+    Aw = A*weight.reshape(-1,1)
+    xcov = np.linalg.inv(A.T @ Aw)
+    xerr = np.sqrt(np.diag(xcov))
+
+
+    # How about the uncertainties??
+    
+    # Background
+    if doback:
+        spec = x[:-1]
+        back = x[-1]
+    else:
+        spec = x
+        back = 0.0
+    
+    return spec,specerr,back,backerr
+
+def extractcol(flux,fluxerr,xcol,tr,doback=False,method='lstsq'):
     """
     This extracts flux of multiple spectra from a single column using empirical PSFs.
 
@@ -783,6 +885,11 @@ def extractcol(flux,fluxerr,xcol,tr,doback=False,skip=False,subonly=False):
        Traces object.
     doback : boolean, optional
        Subtract the background.  False by default.
+    method : str, optional
+       The method to use: 'tridiag', 'lstsq'.
+         triag: fit tridiagonal matrix
+         lstsq: full least-squares fitting
+       Default is 'lstsq'.
 
     Returns
     -------
@@ -818,7 +925,10 @@ def extractcol(flux,fluxerr,xcol,tr,doback=False,skip=False,subonly=False):
     # Now get the PSF information
     ylo = np.zeros(len(index),int)
     yhi = np.zeros(len(index),int)
-    psf = np.zeros((len(index),ysize),float)
+    if method=='lstsq':
+        psf = np.zeros((len(index),len(flux)),float)
+    else:
+        psf = np.zeros((len(index),ysize),float)        
     for i in range(len(index)):
         t = tr[index[i]]
         ymid = np.polyval(t.coef,xcol)
@@ -829,12 +939,18 @@ def extractcol(flux,fluxerr,xcol,tr,doback=False,skip=False,subonly=False):
         psf1 = psf1[:,0]
         ylo[i] = ylo1
         yhi[i] = yhi1
-        psf[i,:len(psf1)] = psf1
+        if method=='lstsq':
+            psf[i,ylo1:yhi1] = psf1
+        else:
+            psf[i,:len(psf1)] = psf1            
         
     ntrace = len(index)
 
     # Solve for the fluxes
-    spec,specerr,mask,back = _extractcol(flux,fluxerr,ylo,yhi,psf,doback=doback)
+    if method=='lstsq':
+        spec,specerr,mask,back = _solvecol(flux,fluxerr,psf,doback=doback)
+    else:
+        spec,specerr,mask,back = _extractcol(flux,fluxerr,ylo,yhi,psf,doback=doback)
     
     # Initialize output arrays
     dt = [('flux',float),('err',float),('mask',int),('back',float),('trace',int)]
@@ -940,7 +1056,7 @@ def _extractcol(flux,fluxerr,ylo,yhi,psf,doback=False):
         nback = 1 
     else:
         nback = 0
-    back = 0.0        
+    back = 0.0
     beta = np.zeros((ntrace+nback),float)
     betavar = np.zeros((ntrace+nback),float)
     psftot = np.zeros((ntrace+nback),float)
@@ -1013,6 +1129,8 @@ def _extractcol(flux,fluxerr,ylo,yhi,psf,doback=False):
             temp[bad[bad1]+1] = 0
             tridiag[0,:] = temp
     if ngood>0:
+        # Solving tridiagonal matrix
+        # https://en.wikipedia.org/wiki/Tridiagonal_matrix_algorithm
         a = tridiag[0,:][good]
         b = tridiag[1,:][good]
         c = tridiag[2,:][good]
@@ -1042,7 +1160,7 @@ def _extractcol(flux,fluxerr,ylo,yhi,psf,doback=False):
             mask[good] = 0
             if nbad > 0:
                 mask[bad] = 1
-            
+                
     # No good fibers for this column
     else:
         spec[:] = 0.0
