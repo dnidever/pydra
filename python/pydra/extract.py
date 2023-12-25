@@ -809,7 +809,7 @@ def _solvecol(flux,fluxerr,psf,doback=True):
     B = flux.copy()
     # When solving it with lstsq(), we need to rescale A and B by sqrt(weight)
     weight = 1/fluxerr**2
-    wtsqr = 1/fluxerr
+    wtsqr = np.sqrt(weight)
     bad = ((~np.isfinite(flux)) | (flux<0) | (~np.isfinite(fluxerr)))
     if np.sum(bad)>0:
         B[bad] = 0
@@ -818,8 +818,10 @@ def _solvecol(flux,fluxerr,psf,doback=True):
     Bw = (B*wtsqr).reshape(-1,1)
     x,resid,rank,s = np.linalg.lstsq(Aw, Bw)
     model = np.dot(A,x[:,0])
-    chisq = np.sum((flux-model1)**2/fluxerr**2)
-    # this is ~6x faster than sklearn
+    chisq = np.sum((flux-model)**2/fluxerr**2)
+    # this is ~6x faster than sklearn, LinearRegression
+
+    print('chisq: ',chisq)
     
     # Get uncertainties
     # https://en.wikipedia.org/wiki/Weighted_least_squares
