@@ -17,6 +17,185 @@ import matplotlib.pyplot as plt
 #from . import utils,robust,mmm
 from . import extract as xtract
 
+
+def traceim(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
+            neifluxratio=0.3,verbose=False):
+    """
+    Find traces in the image.  The dispersion dimension is assumed
+    to be along the X-axis.
+
+    Parameters
+    ----------
+    im : numpy array
+       2-D image to find the traces in.
+    nbin : int, optional
+       Number of columns to bin to find peaks.  Default is 50.
+    minsigheight : float, optional
+       Height threshold for the trace peaks based on standard deviation
+       in the background pixels (median filtered).  Default is 3.
+    minheight : float, optional
+       Absolute height threshold for the trace peaks.  Default is to
+       use `minsigheight`.
+    hratio2 : float, optional
+       Ratio of peak height to the height two pixels away in the
+       spatial profile, e.g. height_2pixelsaway < 0.8*height_peak.
+       Default is 0.8.
+    neifluxratio : float, optional
+       Ratio of peak flux in one column block and the next column
+       block.  Default is 0.3.
+    verbose : boolean, optional
+       Verbose output to the screen.  Default is False.
+
+    Returns
+    -------
+    xmed : numpy array
+       X-values for MEDIM.
+    medim : numpy array
+       The median image of the columns.
+    peaks : numpy array
+       The 2-D peaks image.
+    pmask : numpy array
+       The 2-D boolean mask image for the trace peak pixels.
+    xindex : index
+       The X-values index of peaks.
+
+    Example
+    -------
+
+    xmed,medim,peaks,pmask,xindex = traceim(im)
+
+    """
+    # Median filter in nbin column blocks all in one shot
+    medim1 = dln.rebin(im,binsize=[1,nbin],med=True)
+    smedim1 = uniform_filter(medim1,[3,1])  # average slightly in Y-direction
+    xmed1 = dln.rebin(x,binsize=nbin,med=True)
+    # half-steps
+    medim2 = dln.rebin(im[:,nbin//2:],binsize=[1,nbin],med=True)
+    smedim2 = uniform_filter(medim2,[3,1])  # average slightly in Y-direction
+    xmed2 = dln.rebin(x[nbin//2:],binsize=nbin,med=True)
+    # Splice them together
+    medim = dln.splice(medim1,medim2,axis=1)
+    smedim = dln.splice(smedim1,smedim2,axis=1)    
+    xmed = dln.splice(xmed1,xmed2,axis=0)
+    nxb = medim.shape[1]
+
+    # Compare flux values to neighboring spatial pixels
+    #  and two pixels away
+    # Shift and mask wrapped values with NaN
+    rollyp2 = dln.roll(smedim,2,axis=0)
+    rollyp1 = dln.roll(smedim,1,axis=0)
+    rollyn1 = dln.roll(smedim,-1,axis=0)
+    rollyn2 = dln.roll(smedim,-2,axis=0)
+    rollxp1 = dln.roll(smedim,1,axis=1)
+    rollxn1 = dln.roll(smedim,-1,axis=1)
+    peaks = ( (((smedim >= rollyn1) & (smedim > rollyp1)) |
+               ((smedim > rollyn1) & (smedim >= rollyp1))) &
+              (rollyp2 < hratio2*smedim) & (rollyn2 < hratio2*smedim) &
+	      (smedim > height_thresh))
+    
+    # Now require trace heights to be within ~30% of at least one neighboring
+    #   median-filtered column block
+    peaksht = ((np.abs(smedim[peaks]-rollxp1[peaks])/smedim[peaks] < neifluxratio) |
+              (np.abs(smedim[peaks]-rollxn1[peaks])/smedim[peaks] < neifluxratio))
+    ind = np.where(peaks.ravel())[0][peaksht]
+    ypind,xpind = np.unravel_index(ind,peaks.shape)
+    xindex = dln.create_index(xpind)
+    
+    # Boolean mask image for the trace peak pixels
+    pmask = np.zeros(smedim.shape,bool)
+    pmask[ypind,xpind] = True
+    
+    # Compute height threshold from the background pixels
+    #  need the traces already to do this
+    if minheight is None:
+        # Grow peak mask by 7 pixels in spatial and 5 in dispersion direction
+        #  the rest of the pixels are background
+        exclude_mask = convolve2d(pmask,np.ones((7,5)),mode='same')
+        backmask = (exclude_mask < 0.5)
+        backpix = smedim[backmask]
+        medback,sigback = backvals(backpix)
+        # Use the final background values to set the height threshold
+        height_thresh = medback + minsigheight * sigback
+        if verbose: print('height threshold',height_thresh)
+        # Impose this on the peak mask
+        #oldpmask = pmask
+        #pmask = (smedim*pmask > height_thresh)
+        #ypind,xpind = np.where(pmask)
+        oldpmask = pmask
+        ypind,xpind = np.where((smedim*pmask > height_thresh))
+        # Create the X-values index of peaks
+        xindex = dln.create_index(xpind)
+
+    return xmed,medim,peaks,pmask,xindex
+    
+
+def hornefit(im,x=None,y=None,nbin=50):
+    """
+    Fit spectral trace and PSF using the Horne 1986 method.
+
+    Parameters
+    ----------
+    im : numpy array
+       The image with the spectrum to trace.
+    x : numpy array, optional
+       The X-array for IM.
+    y : numpy array, optional
+       The Y-array for IM.
+
+    Returns
+    -------
+    psf : numpy array
+       The 2D PSF image.
+
+    Example
+    -------
+
+    psf = hornefit(im,x,y):
+
+    """
+
+    ny,nx = im.shape
+    if x is None:
+        x = np.arange(nx)
+    if y is None:
+        y = np.arange(ny)
+
+    xmed,medim,peaks,pmask,xindex = traceim(im)
+
+    
+def marshfit(im,x=None,y=None,nbin=50):
+    """
+    Fit spectral trace and PSF using the Marsh 1989 method.
+
+    Parameters
+    ----------
+    im : numpy array
+       The image with the spectrum to trace.
+    x : numpy array, optional
+       The X-array for IM.
+    y : numpy array, optional
+       The Y-array for IM.
+
+    Returns
+    -------
+    psf : numpy array
+       The 2D PSF image.
+
+    Example
+    -------
+
+    psf = marshfit(im,x,y):
+
+    """
+
+    ny,nx = im.shape
+    if x is None:
+        x = np.arange(nx)
+    if y is None:
+        y = np.arange(ny)
+
+    xmed,medim,peaks,pmask,xindex = traceim(im)
+    
 class Traces():
     """
     Class to hold multiple spectral traces.
@@ -382,11 +561,11 @@ class Trace():
             return None
         return np.max(self()[:,1])        
     
-    @property
-    def sigma(self):
-        if self.hasdata==False:
-            return None
-        return self._data['gysigma']
+    #@property
+    #def sigma(self):
+    #    if self.hasdata==False:
+    #        return None
+    #    return self._data['gysigma']
 
     @property
     def coef(self):
@@ -401,7 +580,26 @@ class Trace():
             return None
         else:
             return self._data['sigcoef']        
-        
+
+    def sigma(self,x=None,xr=None):
+        """ Return Gaussian sigma for x values."""
+        if x is None and xr is None:
+            x = np.arange(self.xmin,self.xmax)
+        if x is None and xr is not None:
+            x = nplarange(xr[0],xr[1])
+        return np.polyval(self.sigcoef,x)
+
+    def amplitude(self,x=None,xr=None):
+        """ Return Gaussian amplitude for x values."""
+        if x is None and xr is None:
+            x = np.arange(self.xmin,self.xmax)
+        if x is None and xr is not None:
+            x = nplarange(xr[0],xr[1])
+        sig = self.sigma(x)
+        # Gaussian area is A = ht*wid*sqrt(2*pi)
+        # ht = 1/(sigma*np.sqrt(2*np.pi)
+        return 1/(sig*np.sqrt(2*np.pi))
+    
     def fit(self,image,initpos=None):
         """ Fit a trace to data."""
         if initpos is not None:
@@ -1183,8 +1381,9 @@ def trace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
     nprofiles = np.sum([tr['ncol'] for tr in tracelist])
     profiles = np.zeros((nprofiles,9),float) + np.nan  # all bad to start
     xprofiles = np.zeros((nprofiles,9),int)
+    trindex = np.zeros(nprofiles,int)
     count = 0
-    for tr in tracelist:
+    for t,tr in enumerate(tracelist):
         for i in range(tr['ncol']):
             if tr['yvalues'][i]<4:        # at bottom edge
                 lo = 4-tr['yvalues'][i]
@@ -1201,7 +1400,12 @@ def trace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
             profiles[count,:] = yp
             xp = np.arange(9)+tr['yvalues'][i]-4            
             xprofiles[count,:] = xp
+            trindex[count] = t
             count += 1
+            
+    #return xp,medim
+    #return xprofiles,profiles
+            
     # Get Gaussian parameters for all profiles at once
     pars = gpars(xprofiles,profiles)
     # Stuff the Gaussian parameters into the list
@@ -1215,7 +1419,7 @@ def trace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
             tr['gycenter'][i] = pars[count,1]
             tr['gysigma'][i] = pars[count,2]
             count += 1
-
+        
     # Fit trace coefficients
     for tr in tracelist:
         tr['tcoef'] = None
@@ -1263,6 +1467,150 @@ def trace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
         tr['sigcoef'] = coef
         tr['sigstd'] = std
 
+    # -resample each column onto the integer rows
+    # -can fit polynomial to each row, just like Horne/Marshall method
+    # -to make the model, get the values on the integer rows, and then
+    #  resample onto the correct shifted values
+
+    for t,tr in enumerate(tracelist):
+        profiles = np.zeros((tr['ncol'],9),float)+np.nan
+        xprofiles = np.zeros((tr['ncol'],9),float)
+        dxprofiles = np.zeros((tr['ncol'],9),float)
+        xprofile = np.arange(-4,5)
+        yprofile = np.zeros((tr['ncol'],9),float)
+        for i in range(tr['ncol']):
+            if tr['yvalues'][i]<4:        # at bottom edge
+                lo = 4-tr['yvalues'][i]
+                yp = np.zeros(9,float)+np.nan
+                yp[lo:] = medim[:tr['yvalues'][i]+5,tr['xbvalues'][i]]                
+            elif tr['yvalues'][i]>(ny-5):   # at top edge
+                hi = 9-(ny-tr['yvalues'][i])+1
+                yp = np.zeros(9,float)+np.nan
+                yp[:hi] = medim[tr['yvalues'][i]-4:,tr['xbvalues'][i]]
+            else:
+                lo = tr['yvalues'][i]-4
+                hi = tr['yvalues'][i]+5
+                yp = medim[lo:hi,tr['xbvalues'][i]]
+            profiles[i,:] = yp
+            xp = np.arange(9)+tr['yvalues'][i]-4
+            xprofiles[i,:] = xp            
+            dxp = xp-np.polyval(tr['tcoef'],tr['xvalues'][i])
+            dxprofiles[i,:] = dxp
+            good = np.isfinite(yp)
+            yout = dln.interp(dxp[good],yp[good],xprofile,kind='quadratic',extrapolate=False)
+            yprofile[i,:] = yout/np.nansum(yout)
+
+        # Fit each row
+        coefarr = np.zeros((9,3),float)
+        for i in range(9):
+            good = np.isfinite(yprofile[:,i])
+            if np.sum(good)>0.5*tr['ncol']:
+                x = np.array(tr['xvalues'])[good]
+                y = yprofile[good,i]
+                coef1 = np.polyfit(x,y,1)
+                model1 = np.polyval(coef1,x)
+                rms1 = np.sqrt(np.mean((y-model1)**2))
+                chisq1 = np.sum((y-model1)**2)
+                lnl1 = -0.5*np.sum((y-model1)**2)-np.pi*len(y)
+                bic1 = 2*np.log(len(y))-2*lnl1
+                coef2 = np.polyfit(x,y,2)
+                model2 = np.polyval(coef2,x)
+                rms2 = np.sqrt(np.mean((y-model2)**2))
+                chisq2 = np.sum((y-model2)**2)
+                lnl2 = -0.5*np.sum((y-model2)**2)-np.pi*len(y)
+                bic2 = 3*np.log(len(y))-2*lnl2
+                coef3 = np.polyfit(x,y,3)
+                model3 = np.polyval(coef3,x)
+                rms3 = np.sqrt(np.mean((y-model3)**2))
+                chisq3 = np.sum((y-model2)**2)                
+                lnl3 = -0.5*np.sum((y-model3)**2)-np.pi*len(y)
+                bic3 = 4*np.log(len(y))-2*lnl3
+                coef4 = np.polyfit(x,y,4)
+                model4 = np.polyval(coef4,x)
+                rms4 = np.sqrt(np.mean((y-model4)**2))
+                chisq4 = np.sum((y-model4)**2)                
+                lnl4 = -0.5*np.sum((y-model4)**2)-np.pi*len(y)
+                bic4 = 5*np.log(len(y))-2*lnl4
+                coef5 = np.polyfit(x,y,5)
+                model5 = np.polyval(coef5,x)
+                rms5 = np.sqrt(np.mean((y-model5)**2))
+                chisq5 = np.sum((y-model5)**2)
+                lnl5 = -0.5*np.sum((y-model5)**2)-np.pi*len(y)
+                bic5 = 6*np.log(len(y))-2*lnl5
+
+                #medy = median_filter(y,7)
+
+                # Maybe use Bayesian Information Criterion (BIC)
+                # to decide which order to use
+                # BIC = k*ln(n) - 2*ln(L)
+                # k = number of model parameters
+                # n = number of data points
+                # L = the maximized value of the likelihood function of the model
+                #   = -0.5*chisq - 0.5*Sum(2*pi*sigma_i**2)
+
+                from sklearn.preprocessing import PolynomialFeatures
+                import statsmodels.api as sm
+
+                model = sm.OLS(y,x).fit()
+                
+                from dlnpyutils import plotting as pl
+                import pdb; pdb.set_trace()
+
+            
+    # Fit empirical correction terms
+    for i,tr in enumerate(tracelist):
+        ind, = np.where(trindex == i)
+        xp1 = np.array(tr['xvalues']).reshape(-1,1) + np.zeros(9)
+        yp1 = xprofiles[ind,:]
+        flx1 = profiles[ind,:]
+        # we should use the polynomial values
+        gfit = np.zeros(xp1.shape,float)
+        for j in range(tr['ncol']):
+            gp = [tr['gyheight'][j],tr['gycenter'][j],tr['gysigma'][j]]
+            gfit[j,:] = dln.gaussian(yp1[j,:],*gp)
+        ycenter = np.polyval(tr['tcoef'],tr['xvalues'])
+        sigma = np.polyval(tr['sigcoef'],tr['xvalues'])
+        hcoef = np.polyfit(tr['xvalues'],tr['gyheight'],3)
+        height = np.polyval(hcoef,tr['xvalues'])
+        #height = 1/(sigma*np.sqrt(2*np.pi))
+        tot1 = np.sum(flx1,axis=1)
+        yp2 = yp1-ycenter.reshape(-1,1)
+        yp3 = yp2 / sigma.reshape(-1,1)
+        flx2 = flx1 / height.reshape(-1,1)
+        flx2 = flx1 / tot1.reshape(-1,1)        
+
+        from scipy.stats import binned_statistic,binned_statistic_2d
+        ybins = np.arange(-4.0,4.5,0.5)
+        ymn,yedge,binnumber = binned_statistic(yp2.ravel(),flx2.ravel(),bins=ybins,statistic='mean')
+        # use least squares to get slope and zero-point in each Y-bin
+        # slope = Sum((xi-xmean)*(yi-ymean))/Sum((xi-xmean)^2)
+        # zpterm = ymean - slope*xmean
+        xmn,yedge,binnumber = binned_statistic(yp2.ravel(),xp1.ravel(),bins=ybins,statistic='mean')
+        c0 = np.zeros(len(ybins))
+        c1 = np.zeros(len(ybins))
+        for k in range(len(ybins)):
+            ind, = np.where(binnumber==k)
+            x1 = xp1.ravel()[ind]
+            y1 = flx2.ravel()[ind]
+            xmn = np.mean(x1)
+            ymn = np.mean(y1)
+            slp = np.sum((x1-xmn)*(y1-ymn))/np.sum((x1-xmn)**2)
+            zp = ymn-slp*xmn
+            c0[k] = zp
+            c1[k] = slp
+
+        model = c0.reshape(-1,1) + x*c1.reshape(-1,1)
+        
+        from dlnpyutils import plotting as pl
+        #pl.scatter(xp1,yp2,flx2)
+        #pl.scatter(yp2,flx2,xp1)
+        #pl.scatter(xp1,yp2,flx1/gfit)
+        #pl.scatter(yp2,flx1/gfit,xp1)
+        
+        import pdb; pdb.set_trace()
+
+
+        
     # Should we check for overlap of traces?
         
     # Add YMED and sort
