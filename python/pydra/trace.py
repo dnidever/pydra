@@ -7,6 +7,7 @@ from scipy.special import erf,wofz
 from scipy.optimize import curve_fit, least_squares
 from scipy.signal import find_peaks,argrelextrema,convolve2d
 from scipy.ndimage import median_filter,uniform_filter
+from scipy import stats
 from astropy.io import fits
 from scipy import ndimage
 from scipy.interpolate import interp1d
@@ -17,6 +18,701 @@ import matplotlib.pyplot as plt
 #from . import utils,robust,mmm
 from . import extract as xtract
 
+@njit
+def quadratic_coefficients(x,y):
+    """ Calculate the quadratic coefficients from the three points."""
+    #https://www.azdhs.gov/documents/preparedness/state-laboratory/lab-licensure-certification/technical-resources/
+    #    calibration-training/12-quadratic-least-squares-regression-calib.pdf
+    #quadratic regression statistical equation
+    # y = ax**2 + b*x + c
+    n = len(x)
+    Sxx = np.sum(x**2) - np.sum(x)**2/n
+    Sxy = np.sum(x*y) - np.sum(x)*np.sum(y)/n
+    Sxx2 = np.sum(x**3) - np.sum(x)*np.sum(x**2)/n
+    Sx2y = np.sum(x**2 * y) - np.sum(x**2)*np.sum(y)/n
+    Sx2x2 = np.sum(x**4) - np.sum(x**2)**2/n
+    # a = ( S(x^2*y)*S(xx)-S(xy)*S(xx^2) ) / ( S(xx)*S(x^2x^2) - S(xx^2)^2 )
+    # b = ( S(xy)*S(x^2x^2) - S(x^2y)*S(xx^2) ) / ( S(xx)*S(x^2x^2) - S(xx^2)^2 )
+    denom = Sxx*Sx2x2 - Sxx2**2
+    if denom==0:
+        return [np.nan,np.nan,np.nan]
+    a = ( Sx2y*Sxx - Sxy*Sxx2 ) / denom
+    b = ( Sxy*Sx2x2 - Sx2y*Sxx2 ) / denom
+    c = np.median(y - (a*x**2+b*x))
+    coef = [a,b,c]
+    return coef
+
+@njit
+def quadratic_bisector(x,y):
+    """ Calculate the axis of symmetric or bisector of parabola"""
+    # https://www.azdhs.gov/documents/preparedness/state-laboratory/lab-licensure-certification/technical-resources/
+    #    calibration-training/12-quadratic-least-squares-regression-calib.pdf
+    # quadratic regression statistical equation
+    n = len(x)
+    if n<3:
+        return None
+    Sxx = np.sum(x**2) - np.sum(x)**2/n
+    Sxy = np.sum(x*y) - np.sum(x)*np.sum(y)/n
+    Sxx2 = np.sum(x**3) - np.sum(x)*np.sum(x**2)/n
+    Sx2y = np.sum(x**2 * y) - np.sum(x**2)*np.sum(y)/n
+    Sx2x2 = np.sum(x**4) - np.sum(x**2)**2/n
+    #a = ( S(x^2*y)*S(xx)-S(xy)*S(xx^2) ) / ( S(xx)*S(x^2x^2) - S(xx^2)^2 )
+    #b = ( S(xy)*S(x^2x^2) - S(x^2y)*S(xx^2) ) / ( S(xx)*S(x^2x^2) - S(xx^2)^2 )
+    denom = Sxx*Sx2x2 - Sxx2**2
+    if denom==0:
+        return np.nan
+    a = ( Sx2y*Sxx - Sxy*Sxx2 ) / denom
+    b = ( Sxy*Sx2x2 - Sx2y*Sxx2 ) / denom
+    if a==0:
+        return np.nan
+    return -b/(2*a)
+
+@njit
+def gvals(ycen,ysigma,y):
+    """
+    Calculate Gaussians in list.
+    """
+    nx = len(ycen)
+    ny = len(y)
+    model = np.zeros((ny,nx),float)
+    fac = np.sqrt(2*np.pi)
+    for i in range(nx):
+        #  Gaussian area is A = ht*wid*sqrt(2*pi)
+        # sigma = np.maximum( totflux/(ht0*np.sqrt(2*np.pi))
+        amp = 1/(fac*ysigma[i])
+        model[:,i] = amp*np.exp(-0.5*(y-ycen[i])**2/ysigma[i]**2)
+    return model
+
+@njit
+def polyval(coef,x):
+    """ Evaluation polynomial. """
+    nc = len(coef)
+    y = np.zeros(len(x),float)
+    for i in range(nc):
+        order = nc-i-1
+        y += coef[i]*x**order
+    return y
+
+@njit
+def gaussian(x,coef):
+    """ Evaluate gaussian."""
+    y = coef[0]*np.exp(-0.5*(x-coef[1])**2/coef[2]**2)
+    if len(coef)==4:
+        y += coef[3]
+    return y
+
+@njit
+def gparsmoments(x,y):
+    """
+    Estimate Gaussian center, sigma, and height using moments.
+
+    Parameters
+    ----------
+    x : numpy array
+       Numpy array of x-values.
+    y : numpy array
+       Numpy array of flux values.
+
+    Returns
+    -------
+    amp : float
+       Gaussian amplitude.
+    center : float
+       Gaussian center.
+    sigma : float
+       Gaussian sigma.
+
+    Example
+    -------
+    
+    amp,center,sigma = gparsmoments(x,y)
+
+    """
+
+    # If there is a large constant offset, then all the values will be off
+    
+    toty = np.sum(y)                            # 0th moment
+    cen = np.sum(x*y)/toty                      # 1st moment
+    sigma = np.sqrt(np.sum(y*(x-cen)**2)/toty)  # 2nd central moment
+    # Area = ht*sigma*sqrt(2*pi)
+    # ht = Area/(sigma*sqrt(2*pi))
+    dx = x[1]-x[0]    
+    amp = toty*dx/(sigma*np.sqrt(2*np.pi))
+    return amp,cen,sigma
+
+@njit
+def gparspoly(usq,y):
+    """
+    Estimate Gaussian amplitude and offset using polynomial estimate.
+
+    Parameters
+    ----------
+    usq : numpy array
+       Numpy array of the square of the shifted and scaled x-values, u=(x-cen)/sigma.
+    y : numpy array
+       Numpy array of flux values.
+
+    Returns
+    -------
+    amp : float
+       The Gaussian amplitude value.
+    offset : float
+       The constant offset.
+
+    Example
+    -------
+    
+    amp,offset = gparspoly(usq,y)
+
+    """
+    mny = np.mean(y)
+    
+    # These are the Gaussian polynomial coefficients for A=1 and sigma=1
+    # lowest order FIRST
+    f = np.array([ 9.96182626e-01, -4.74980034e-01,  9.79500447e-02, -9.77177326e-03,
+                   3.78864533e-04])
+    # y = offset + A*(f0 + f1*u/sigma^2 + f2*u^2/sigma^4 + f3*u^3/sigma^6 + f4*u^4/sigma^8)
+    #
+    # y = offset + A*(f0 + f1*(u/sigma^2) + f2*(u/sigma^2)^2 + f3*(u/sigma^2)^3 + f4*(u/sigma^2)^4)
+    # us = u/sigma^2
+    # y = offset + A*(f + f1*us + f2*us^2 + f3*us^3 + f4*us^4)
+    # if we have an estimate for sigma, then we can solve for A and offset directly using linear OLS
+    # where the term in the parentheses is the X, A is the slope and offset is the constant term
+    # we can then refine to get a better sigma
+
+    # Use initial centroid and sigma estimate to get Amplitude and offset
+    fact = f[0] + f[1]*usq + f[2]*usq**2  + f[3]*usq**3  + f[4]*usq**4
+    mnfact = np.mean(fact)
+    amp = (np.sum(fact*y)-mnfact*mny)/(np.sum(fact**2)-mnfact**2)
+    offset = amp*mnfact-mny
+    
+    return amp,offset
+
+@njit
+def gparslog(x,y):
+    """
+    Estimate Gaussian parameters by taking natural log of the Y-values.
+
+    Parameters
+    ----------
+    x : numpy array
+       Numpy array of x-values.
+    y : numpy array
+       Numpy array of flux values.
+
+    Returns
+    -------
+    amp : float
+       Gaussian amplitude.
+    center : float
+       Gaussian center.
+    sigma : float
+       Gaussian sigma.
+
+    Example
+    -------
+    
+    amp,center,sigma = gparslog(x,y)
+
+    """
+
+    # This assumes there is NO constant offset
+    # If there is, then the amplitude and sigma will be off.
+    
+    # Directly solve for the parameters using ln(y)
+    #  y = A*exp(-0.5*(x-x0)^2/sigma^2)
+    #  ln(y) = ln(A)-0.5*(x-x0)^2/sigma^2
+    #        = -0.5/sigma^2 * x^2 + x0/sigma^2 * x + ln(A)-0.5*x0^2/sigma^2
+    #  fit quadratic equation in x
+    #  a = -0.5/sigma^2              quadratic term
+    #  b = x0/sigma^2                linear term
+    #  c = ln(A)-0.5*x0^2/sigma^2    constant term
+    #  ->   sigma=sqrt(-1/(2*a))
+    #  ->   x0=b*sigma**2
+    #  ->  A=exp(c + x0**2/(2*sigma**2))
+    lny = np.log(y)
+    quadcoef = quadratic_coefficients(x,lny)
+    sigma = np.sqrt(-1/(2*quadcoef[0]))
+    cen = quadcoef[1]*sigma**2
+    amp = np.exp(quadcoef[2]+cen**2/(2*sigma**2))
+    return amp,cen,sigma
+
+@njit
+def gparssigmahalfflux(u,y):
+    """
+    Estimate Gaussian sigma by finding the x-position where the flux has reached
+    half of the maximum.
+
+    Parameters
+    ----------
+    u : numpy array
+       Numpy array of scaled x-values, u=|x-cen|.
+    y : numpy array
+       Numpy array of flux values.
+
+    Returns
+    -------
+    sigma : float
+       Gaussian sigma.
+
+    Example
+    -------
+    
+    sigma = gparssigmahalfflux(u,y)
+
+
+    """
+    # This assumes there is no constant offset
+    n = len(u)
+    si = np.argsort(u)
+    uu = u[si]
+    yy = y[si]
+    maxy = np.max(yy)
+    halfmaxy = 0.5*maxy
+    lowind = np.where(yy < halfmaxy)[0]
+    if len(lowind)>0:
+        lo = lowind[0]        
+    else:
+        lo = n-1
+    hiind = np.where(yy >= halfmaxy)[0]    
+    hi = hiind[-1]
+    # linearly interpolate between the two points
+    slp = (yy[hi]-yy[lo])/(uu[hi]-uu[lo])
+    yoff = yy[hi]-slp*uu[hi]
+    xhalf = (halfmaxy-yoff)/slp
+    fwhm = 2*xhalf
+    sigma = fwhm/2.35
+    return sigma
+    
+@njit
+def gparssigmaarea(x,y,amp):
+    """
+    Estimate Gaussian sigma using the area and estimate of amplitude.
+
+    Parameters
+    ----------
+    x : numpy array
+       Numpy array of x-values.
+    y : numpy array
+       Numpy array of flux values.
+    amp : float
+       Estimate of Gaussian amplitude.
+
+    Returns
+    -------
+    sigma : float
+       Gaussian sigma.
+
+    Example
+    -------
+    
+    sigma = gparssigmaarea(x,y,amp)
+
+    """
+    # This assumes that there is no constant offset
+    # and that we have the full Gaussian out to +/-3 sigma
+    dx = x[1]-x[0]
+    totflux = np.sum(y)
+    sigma = totflux*dx/(amp*np.sqrt(2*np.pi))
+    return sigma
+
+@njit
+def gparssigmascale(usq,yscl):
+    """
+    Estimate Gaussian sigma by scaling u/y.
+
+    Parameters
+    ----------
+    usq : numpy array
+       Numpy array of the square of the shifted x-values, u=(x-cen).
+         This u is NOT scaled by sigma.
+    yscl : numpy array
+       Numpy array of scaled Y-values, yscl=(y-offset)/amp
+
+    Returns
+    -------
+    amp : float
+       Gaussian amplitude.
+    center : float
+       Gaussian center.
+    sigma : float
+       Gaussian sigma.
+
+    Example
+    -------
+    
+    amp,center,sigma = gparssigmascale(usq,yscl)
+
+    """
+
+    # Get improved sigma estimate
+    # we are going to "invert" the problem and scale u to get the sigma
+    # highest orders FIRST
+    ycoef = np.array([ 3.26548205e+04, -1.74691753e+05,  4.02541663e+05, -5.22876009e+05,
+                       4.20862134e+05, -2.17473350e+05,  7.24096646e+04, -1.52451852e+04,
+                       1.96347765e+03, -1.55782907e+02,  1.03476392e+01])
+    # Only include "high" values, lower values are more likely to be dominated by a constant offset
+    good = (yscl > 0.15)
+    # This should now follow the "standard curve" and u is just scaled by sigma^2
+    # need to calculate the u-values for the "standard curve" for our y-values
+    ustandard = polyval(ycoef,yscl[good])
+    # now calculate the least squares scaling factor
+    scale = np.sum(usq[good]*ustandard)/np.sum(ustandard**2)
+    sigma = np.sqrt(scale)
+    return sigma
+
+@njit
+def gparsampdiffs(u,y):
+    """
+    Estimate Gaussian amplitude and offset using the known flux differences
+    of pixels near the peak.
+
+    Parameters
+    ----------
+    u : numpy array
+       Numpy array of the shifted and sigma-scaled x-values, u=|(x-cen)/sigma|.
+    y : numpy array
+       Numpy array of the Y-values.
+
+    Returns
+    -------
+    amp : float
+       Gaussian amplitude.
+    offset : float
+       Constant offset
+
+    Example
+    -------
+    
+    amp,offset = gparsampdiffs(u,y)
+
+    """
+
+    # This method is quite robust
+    
+    # Use flux differences (then the offset drops out) between pixels near the peak
+    #  to estimate the amplitude and constant offset
+    udiff = u.reshape(-1,1) - u.reshape(1,-1)             # all u differences
+    ydiff = y.reshape(-1,1) - y.reshape(1,-1)             # all y differences
+    ygauss = gaussian(u,np.array([1.0,0.0,1.0]))          # Gaussian flux values
+    ygdiff = ygauss.reshape(-1,1) - ygauss.reshape(1,-1)  # Gaussian flux differences
+    # Now find the best scale of the two to get the Gaussian amplitude
+    scale = np.sum(ydiff*ygdiff)/np.sum(ydiff**2)
+    amp = 1/scale
+    # Now estimate the constant offset
+    offset = np.mean(y-amp*ygauss)
+    return amp,offset
+
+@njit
+def gaussxccenter(x,y,coef):
+    """
+    Perform cross-correlation with Gaussian to estimate improved center.
+    A maximum lag of +/-3 pixels is used.  This is then refined with
+    a second cross-correlation with a maximum lag of +/-0.3 pixels in 0.1
+    pixel steps.
+
+    Parameters
+    ----------
+    x : numpy array
+       Numpy array of x-values.
+    y : numpy array
+       Numpy array of flux values.
+    coef : numpy array
+       Numpy array of Gaussian parameters, [amp,center,sigma].
+
+    Returns
+    -------
+    center : float
+       Cross-correlation center.
+
+    Example
+    -------
+    
+    center = gaussxccenter(x,y,coef)
+
+    """
+    maxlag = 3
+    # It's better to subtract off a constant term
+    #  than to just include it in the model
+    if len(coef)==4:
+        yp = y-coef[3]
+    else:
+        yp = y
+    dx = x[1]-x[0]
+    nlag1 = maxlag*2+1
+    nx = len(x)
+    lag1 = np.arange(nlag1)-maxlag
+    # Extend x by +/-maxlog on the two sides
+    xext = np.concatenate((-np.arange(maxlag,0,-1)*dx+x[0],x))
+    xext = np.append(xext,np.arange(1,maxlag+1)*dx+x[-1])
+    model = coef[0]*np.exp(-0.5*(xext-coef[1])**2/coef[2]**2)
+    ccf1 = np.zeros(nlag1,float)
+    for i in range(nlag1):
+        ccf1[i] = np.sum(yp*model[maxlag-lag1[i]:maxlag+nx-lag1[i]])
+    shift1 = quadratic_bisector(lag1,ccf1)
+    cen1 = coef[1]+shift1
+    
+    # Now refine, in 0.1 dx steps
+    maxlag2 = 3
+    nlag2 = maxlag2*2+1
+    lag2 = np.arange(nlag2)-maxlag2
+    ccf2 = np.zeros(nlag2,float)
+    for i in range(nlag2):
+        xoff = cen1+0.1*lag2[i]*dx
+        model2 = coef[0]*np.exp(-0.5*(x-xoff)**2/coef[2]**2)
+        ccf2[i] = np.sum(yp*model2)            
+    shift2 = quadratic_bisector(lag2,ccf2)
+    cen2 = cen1 + shift2*0.1*dx
+    
+    return cen2
+
+@njit
+def gparsmodelscale(x,y,coef):
+    """
+    Estimate Gaussian amplitude and offset by scaling a model.
+
+    Parameters
+    ----------
+    x : numpy array
+       Numpy array of x-values.
+    y : numpy array
+       Numpy array of flux values.
+    coef : numpy array
+       Numpy array of Gaussian parameters [height,center,sigma].
+
+    Returns
+    -------
+    amp : float
+       The Gaussian amplitude value.
+    offset : float
+       The constant offset.
+
+    Example
+    -------
+    
+    amp,offset = gparsmodelscale(x,y,coef)
+
+    """
+    n = len(x)
+    model = gaussian(x,coef)
+    mnx = np.mean(model)
+    sumx2 = np.sum((model-mnx)**2)
+    mny = np.mean(y)
+    sumxy = np.sum((model-mnx)*(y-mny))
+    slope = sumxy/sumx2
+    yoff = mny-slope*mnx
+    return slope,yoff
+    
+#@njit
+def gpars1(x,y):
+    """
+    Simple Gaussian fit using 8th order polynomial estimate.
+
+    Parameters
+    ----------
+    x : numpy array
+       Numpy array of x-values.
+    y : numpy array
+       Numpy array of flux values.
+
+    Returns
+    -------
+    pars : numpy array
+       Gaussian parameters [height, center, sigma].  If multiple
+       profiles are input, then the output dimensions are [Nprofiles,3].
+
+    Example
+    -------
+    
+    pars = gpars1(x,y)
+
+    """
+
+    # This takes about 40 microseconds for 10 points
+    
+    yp = np.maximum(y,0)
+    good, = np.where(np.isfinite(y))
+    xp = x[good]
+    yp = yp[good]
+    ymax = np.max(yp)
+    ymin = np.min(yp)
+    xmax = xp[np.argmax(yp)]
+
+    # Use moments to get first estimates, then iterate
+    # subtract minimum in case there is an offset
+    # fast: 2 microseconds
+    amp0,cen0,sig0 = gparsmoments(xp,yp)
+    good = ((np.abs(x-cen0) <= 3*sig0) & np.isfinite(y))
+    # Re-estimate center and sigma with reduced range
+    #  only if the range changed a lot
+    if len(yp)/np.sum(good) > 1.5:
+        amp0,cen0,sig0 = gparsmoments(x[good],yp[good])
+    # Our Gaussian might be truncated on one side
+    nxsigpos = ((np.max(x[good])-cen0)/sig0)
+    nxsigneg = ((cen0-np.min(x[good]))/sig0)
+    if nxsigpos<0 or nxsigneg<0 or nxsigpos<2 or nxsigneg<2 or np.abs(nxsigpos-nxsigneg)>0.5:
+        # Reflect points about the maximum
+        x2 = np.concatenate((xp-xmax,xmax-xp))+xmax
+        y2 = np.concatenate((yp,yp))
+        # Need to sort or otherwise the dx in gparsmoments() will be wrong
+        si = np.argsort(x2)
+        x2,y2 = x2[si],y2[si]
+        # Need to get unique x-values, otherwise the amplitude will be artificially
+        #  inflated because we added more points
+        _,ui = np.unique(x2,return_index=True)
+        x2,y2 = x2[ui],y2[ui]
+        amp,cen0,sig0 = gparsmoments(x2,y2)
+        good = ((np.abs(x-cen0) <= 3*sig0) & np.isfinite(y))
+        
+    xp = x[good]
+    yp = y[good]
+    u0 = (xp-cen0)**2
+
+    # If there is an appreciable constant offset
+    # moments: gives good center
+
+    # Get initial estimate of amplitude and offset from flux differences
+    # fast, 12 micro seconds
+    A0,offset0 = gparsampdiffs(np.abs(xp-cen0)/sig0,yp)
+    
+    # Use Gaussian polynomial approximation to estimate amplitude and offset
+    #A0,offset0 = gparspoly(u0/sig0**2,yp)
+    
+    # Get improved sigma estimate using u/y scaling
+    # fast: 12 microseconds
+    sig1 = gparssigmascale(u0,(yp-offset0)/A0)
+    
+    # Iterate: Re-estimate center with cross-correlation
+    # somewhat slower: 24 microseconds
+    coef0 = np.array([A0,cen0,sig1,offset0])
+    cen1 = gaussxccenter(xp,yp,coef0)
+    u1 = (xp-cen1)**2
+    
+    # Iterate: Re-estimate A and offset with the improved sigma value
+    #A1,offset1 = gparspoly(u1/sig1**2,yp)
+    A1,offset1 = gparsampdiffs(np.abs(xp-cen1)/sig1,yp)
+    # doesn't improve really
+    
+    # fit amplitude and offset by using a linear fit of the model
+    # (slope is the amplitude and y-offset is the offset term)
+    # fast: 2 microseconds
+    tcoef = np.array([1.0,cen1,sig1])
+    A2,offset2 = gparsmodelscale(xp,yp,tcoef)
+    # doesn't improve really
+
+    import pdb; pdb.set_trace()
+    
+    return A2,cen1,sig1,offset2
+
+@njit
+def gpars1log(x,y):
+    """
+    Simple Gaussian fit to central 5 pixel values.
+
+    Parameters
+    ----------
+    x : numpy array
+       Numpy array of x-values.
+    y : numpy array
+       Numpy array of flux values.
+
+    Returns
+    -------
+    pars : numpy array
+       Gaussian parameters [height, center, sigma].  If multiple
+       profiles are input, then the output dimensions are [3].
+
+    Example
+    -------
+    
+    pars = gpars1(x,y)
+
+    """
+    pars = np.zeros(3,float)
+    nx = len(y)
+    nhalf = nx//2
+    gd = (np.isfinite(y) & (y>0))
+    #if np.sum(gd)<5:
+    x = x[gd]
+    y = y[gd]
+    totflux = np.sum(y)
+    ht0 = y[nhalf]
+    if np.isfinite(ht0)==False:
+        ht0 = np.max(y)
+    # Use flux-weighted moment to get center
+    cen1 = np.sum(y*x)/totflux
+    #  Gaussian area is A = ht*wid*sqrt(2*pi)
+    sigma1 = np.maximum( totflux/(ht0*np.sqrt(2*np.pi)) , 0.01)
+    # Use linear-least squares to calculate height and sigma
+    psf = np.exp(-0.5*(x-cen1)**2/sigma1**2)          # normalized Gaussian
+    wtht = np.sum(y*psf)/np.sum(psf*psf)          # linear least squares
+    
+    # Directly solve for the parameters using ln(y)
+    pars = gparslog(x,y)
+
+    return pars
+
+#@njit
+def gpars(x,y):
+    """
+    Simple Gaussian fit to central pixel values.
+
+    Parameters
+    ----------
+    x : numpy array
+       Numpy array of x-values.
+    y : numpy array
+       Numpy array of flux values.  Can be a single or
+       mulitple profiles.  If mulitple profiles, the dimensions
+       should be [Nprofiles,5].
+
+    Returns
+    -------
+    pars : numpy array
+       Gaussian parameters [height, center, sigma].  If multiple
+       profiles are input, then the output dimensions are [Nprofiles,3].
+
+    Example
+    -------
+    
+    pars = gpars(x,y)
+
+    """
+    
+    if y.ndim==1:
+        nprofiles = 1
+        y = np.atleast_1d(y)
+    else:
+        nprofiles = y.shape[0]
+    nx = y.shape[1]
+    nhalf = nx//2
+    # Loop over profiles
+    pars = np.zeros((nprofiles,4),float)
+    for i in range(nprofiles):
+        # First try the central 5 pixels first        
+        #x1 = x[i,2:7]
+        #y1 = y[i,2:7]
+        x1 = x[i,:]
+        y1 = y[i,:]        
+        gd = (np.isfinite(y1) & (y1>0))
+        if np.sum(gd)<5:
+            x1 = x1[gd]
+            y1 = y1[gd]
+        pars1 = gpars1(x1,y1)
+        # If sigma is too high, then expand to include more points     
+        if pars1[2]>2:
+            x1 = x[i,:]
+            y1 = y[i,:]
+            gd = (np.isfinite(y1) & (y1>0))
+            if np.sum(gd)<9:
+                x1 = x1[gd]
+                y1 = y1[gd]
+            pars1 = gpars1(x1,y1)
+        # Put results in big array
+        pars[i,:] = pars1
+        import pdb; pdb.set_trace()
+        
+    return pars
 
 def traceim(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
             neifluxratio=0.3,verbose=False):
@@ -52,19 +748,29 @@ def traceim(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
        X-values for MEDIM.
     medim : numpy array
        The median image of the columns.
+    smedim : numpy array
+       Slightly smoothed version of medim along Y-axis.
     peaks : numpy array
        The 2-D peaks image.
     pmask : numpy array
        The 2-D boolean mask image for the trace peak pixels.
+    xpind : numpy array
+       X-values for peak mask pixels.
+    ypind : numpy array
+       Y-values for peak mask pixels.       
     xindex : index
        The X-values index of peaks.
 
     Example
     -------
 
-    xmed,medim,peaks,pmask,xindex = traceim(im)
+    xmed,medim,peaks,pmask,xpind,ypind,xindex = traceim(im)
 
     """
+    # This assumes that the dispersion direction is along the X-axis
+    #  Y-axis is spatial dimension
+    ny,nx = im.shape
+    y,x = np.arange(ny),np.arange(nx)
     # Median filter in nbin column blocks all in one shot
     medim1 = dln.rebin(im,binsize=[1,nbin],med=True)
     smedim1 = uniform_filter(medim1,[3,1])  # average slightly in Y-direction
@@ -88,6 +794,10 @@ def traceim(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
     rollyn2 = dln.roll(smedim,-2,axis=0)
     rollxp1 = dln.roll(smedim,1,axis=1)
     rollxn1 = dln.roll(smedim,-1,axis=1)
+    if minheight is not None:
+        height_thresh = minheight
+    else:
+        height_thresh = 0.0
     peaks = ( (((smedim >= rollyn1) & (smedim > rollyp1)) |
                ((smedim > rollyn1) & (smedim >= rollyp1))) &
               (rollyp2 < hratio2*smedim) & (rollyn2 < hratio2*smedim) &
@@ -114,6 +824,10 @@ def traceim(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
         backmask = (exclude_mask < 0.5)
         backpix = smedim[backmask]
         medback,sigback = backvals(backpix)
+        if np.isfinite(medback)==False:
+            medback = np.nanmedian(backpix)
+        if np.isfinite(sigback)==False:
+            sigback = np.nanstd(backpix)
         # Use the final background values to set the height threshold
         height_thresh = medback + minsigheight * sigback
         if verbose: print('height threshold',height_thresh)
@@ -126,12 +840,348 @@ def traceim(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
         # Create the X-values index of peaks
         xindex = dln.create_index(xpind)
 
-    return xmed,medim,peaks,pmask,xindex
-    
+    return xmed,medim,smedim,peaks,pmask,xpind,ypind,xindex
 
-def hornefit(im,x=None,y=None,nbin=50):
+def tracematch(xmed,medim,smedim,peaks,pmask,xpind,ypind,xindex,
+               neifluxratio=0.3,verbose=False):
+    """
+    Matches peaks of traces across column blocks.
+
+    Parameters
+    ----------
+    xmed : numpy array
+       X-values for MEDIM.
+    medim : numpy array
+       The median image of the columns.
+    smedim : numpy array
+       Slightly smoothed version of medim along Y-axis.
+    peaks : numpy array
+       The 2-D peaks image.
+    pmask : numpy array
+       The 2-D boolean mask image for the trace peak pixels.
+    xpind : numpy array
+       X-values for peak mask pixels.
+    ypind : numpy array
+       Y-values for peak mask pixels. 
+    xindex : index
+       The X-values index of peaks.
+
+    Returns
+    -------
+    tracelist : list
+       List of the trace information
+
+    Example
+    -------
+
+    tracelist = tracematch()
+
+    """
+
+    ny,nxb = medim.shape
+    nbin = int(2*(xmed[1]-xmed[0]))
+    
+    # Now match up the traces across column blocks
+    # Loop over the column blocks and either connect a peak
+    # to an existing trace or start a new trace
+    # only connect traces that haven't been "lost"
+    tracelist = []
+    # Looping over unique column blocks, not every one might be represented
+    for i in range(len(xindex['value'])):
+        ind = xindex['index'][xindex['lo'][i]:xindex['hi'][i]+1]
+        nind = len(ind)
+        xind = xpind[ind]
+        yind = ypind[ind]
+        yind.sort()    # sort y-values
+        xb = xind[0]   # this column block index        
+
+        # Deal with neighbors
+        #  we shouldn't have any neighbors in Y
+        if len(ind)>1:
+            diff = dln.slope(np.array(yind))
+            bd, = np.where(diff == 1)
+            if len(bd)>0:
+                torem = []
+                for j in range(len(bd)):
+                    lo = bd[j]
+                    hi = lo+1
+                    if medim[yind[lo],xb] >= medim[yind[hi],xb]:
+                        torem.append(hi)
+                    else:
+                        torem.append(lo)
+                yind = np.delete(yind,np.array(torem))
+                xind = np.delete(xind,np.array(torem))            
+                nind = len(yind)
+
+        if verbose: print(i,xb,len(xind),'peaks')
+        # Adding traces
+        #   Loop through all of the existing traces and try to match them
+        #   to new ones in this row
+        tymatches = []
+        for j in range(len(tracelist)):
+            itrace = tracelist[j]
+            y1 = itrace['yvalues'][-1]
+            x1 = itrace['xbvalues'][-1]
+            deltax = xb-x1
+            # Only connect traces that haven't been lost
+            if deltax<3:
+                # Check the pmask boolean image to see if it connects
+                ymatch = None
+                if pmask[y1,xb]:
+                    ymatch = y1
+                elif pmask[y1-1,xb]:
+                    ymatch = y1-1                       
+                elif pmask[y1+1,xb]:
+                    ymatch = y1+1
+
+                if ymatch is not None:
+                    itrace['yvalues'].append(ymatch)
+                    itrace['xbvalues'].append(xb)
+                    itrace['xvalues'].append(xmed[xb])
+                    itrace['heights'].append(smedim[ymatch,xb])
+                    itrace['ncol'] += 1                    
+                    tymatches.append(ymatch)
+                    if verbose: print(' Trace '+str(j)+' Y='+str(ymatch)+' matched')
+                else:
+                    # Lost
+                    if itrace['lost']:
+                        itrace['lost'] = True
+                        if verbose: print(' Trace '+str(j)+' LOST')
+            # Lost, separation too large
+            else:
+                # Lost
+                if itrace['lost']:
+                    itrace['lost'] = True
+                    if verbose: print(' Trace '+str(j)+' LOST')        
+        # Add new traces
+        # Remove the ones that matched
+        yleft = yind.copy()
+        if len(tymatches)>0:
+            ind1,ind2 = dln.match(yind,tymatches)
+            nmatch = len(ind1)
+            if nmatch>0 and nmatch<len(yind):
+                yleft = np.delete(yleft,ind1)
+            else:
+                yleft = []
+        # Add the ones that are left
+        if len(yleft)>0:
+            if verbose: print(' Adding '+str(len(yleft))+' new traces')
+        for j in range(len(yleft)):
+            # Skip traces too low or high
+            if yleft[j]<2 or yleft[j]>(ny-3):
+                continue
+            itrace = {'index':0,'ncol':0,'yvalues':[],'xbvalues':[],'xvalues':[],'heights':[],
+                      'lost':False}
+            itrace['index'] = len(tracelist)+1
+            itrace['ncol'] = 1
+            itrace['nbin'] = nbin  # save the binning information
+            itrace['yvalues'].append(yleft[j])
+            itrace['xbvalues'].append(xb)
+            itrace['xvalues'].append(xmed[xb])                
+            itrace['heights'].append(smedim[yleft[j],xb])
+            tracelist.append(itrace)
+            if verbose: print(' Adding Y='+str(yleft[j]))
+            
+    # For each trace, check if it continues at the end, but below the nominal height threshold
+    for i in range(len(tracelist)):
+        itrace = tracelist[i]
+        # Check lower X-values
+        flag = 0
+        nnew = 0
+        x1 = itrace['xbvalues'][0]
+        y1 = itrace['yvalues'][0]
+        if x1==0 or x1==(nxb-1): continue  # at edge already
+        while (flag==0):
+            # Check peaks, heights must be within 30% of the height of the last one
+            doesconnect = peaks[y1-1:y1+2,x1-1] & (np.abs(smedim[y1-1:y1+2,x1-1]-smedim[y1,x1])/smedim[y1,x1] < neifluxratio)
+            if np.sum(doesconnect)>0:
+                newx = x1-1
+                if doesconnect[1]==True:
+                    newy = y1
+                elif doesconnect[0]==True:
+                    newy = y1-1
+                else:
+                    newy = y1+1
+                # Add new column to the trace (to beginning)
+                itrace['yvalues'].insert(0,newy)
+                itrace['xbvalues'].insert(0,newx)
+                itrace['xvalues'].insert(0,xmed[newx])
+                itrace['heights'].insert(0,smedim[newy,newx])
+                itrace['ncol'] += 1
+                if verbose:
+                    print(' Trace '+str(i)+' Adding X='+str(newx)+' Y='+str(newy))
+                # Update x1/y1
+                x1 = newx
+                y1 = newy
+                # If at edge, stop                
+                if newx==0 or newx==(nxb-1): flag = 1
+                nnew += 1
+            # No match
+            else:
+                flag = 1
+        # Stuff it back in
+        tracelist[i] = itrace
+        
+        # Check higher X-values
+        flag = 0
+        nnew = 0
+        x1 = itrace['xbvalues'][-1]
+        y1 = itrace['yvalues'][-1]
+        if x1==0 or x1==(nxb-1): continue  # at edge already
+        while (flag==0):
+            # Check peaks, heights must be within 30% of the height of the last one
+            doesconnect = peaks[y1-1:y1+2,x1+1] & (np.abs(smedim[y1-1:y1+2,x1+1]-smedim[y1,x1])/smedim[y1,x1] < neifluxratio)
+            if np.sum(doesconnect)>0:
+                newx = x1+1
+                if doesconnect[1]==True:
+                    newy = y1
+                elif doesconnect[0]==True:
+                    newy = y1-1
+                else:
+                    newy = y1+1
+                # Add new column to the trace
+                itrace['yvalues'].append(newy)
+                itrace['xbvalues'].append(newx)
+                itrace['xvalues'].append(xmed[newx])
+                itrace['heights'].append(smedim[newy,newx])
+                itrace['ncol'] += 1
+                if verbose:
+                    print(' Trace '+str(i)+' Adding X='+str(newx)+' Y='+str(newy))
+                # Update x1/y1
+                x1 = newx
+                y1 = newy
+                # If at edge, stop                
+                if newx==0 or newx==(nxb-1): flag = 1
+                nnew += 1
+            # No match
+            else:
+                flag = 1      
+        # Stuff it back in
+        tracelist[i] = itrace
+
+    return tracelist
+
+def tracegauss(medim,tracelist):
+    """
+    Fit spectral trace and PSF using a Gaussian.
+    The input image should only include one spectrum/trace.
+
+    Parameters
+    ----------
+    medim : numpy array
+       The median image of the columns.
+    tracelist : list
+       List of the trace information.
+
+    Returns
+    -------
+    tracelist : list
+       List of the trace information.
+
+    Example
+    -------
+
+    tracelist = tracegauss(im,tracelist):
+
+    """
+
+    ny,nxb = medim.shape
+    
+    # Calculate Gaussian parameters
+    nprofiles = np.sum([tr['ncol'] for tr in tracelist])
+    profiles = np.zeros((nprofiles,9),float) + np.nan  # all bad to start
+    xprofiles = np.zeros((nprofiles,9),int)
+    trindex = np.zeros(nprofiles,int)
+    count = 0
+    for t,tr in enumerate(tracelist):
+        for i in range(tr['ncol']):
+            if tr['yvalues'][i]<4:        # at bottom edge
+                lo = 4-tr['yvalues'][i]
+                yp = np.zeros(9,float)+np.nan
+                yp[lo:] = medim[:tr['yvalues'][i]+5,tr['xbvalues'][i]]                
+            elif tr['yvalues'][i]>(ny-5):   # at top edge
+                hi = 9-(ny-tr['yvalues'][i])+1
+                yp = np.zeros(9,float)+np.nan
+                yp[:hi] = medim[tr['yvalues'][i]-4:,tr['xbvalues'][i]]
+            else:
+                lo = tr['yvalues'][i]-4
+                hi = tr['yvalues'][i]+5
+                yp = medim[lo:hi,tr['xbvalues'][i]]
+            profiles[count,:] = yp
+            xp = np.arange(9)+tr['yvalues'][i]-4            
+            xprofiles[count,:] = xp
+            trindex[count] = t
+            count += 1
+            
+    # Get Gaussian parameters for all profiles at once
+    pars = gpars(xprofiles,profiles)
+    # Stuff the Gaussian parameters into the list
+    count = 0
+    for tr in tracelist:
+        tr['gyheight'] = np.zeros(tr['ncol'],float)
+        tr['gycenter'] = np.zeros(tr['ncol'],float)
+        tr['gysigma'] = np.zeros(tr['ncol'],float)
+        tr['gyoffset'] = np.zeros(tr['ncol'],float)        
+        for i in range(tr['ncol']):
+            tr['gyheight'][i] = pars[count,0]
+            tr['gycenter'][i] = pars[count,1]
+            tr['gysigma'][i] = pars[count,2]
+            tr['gyoffset'][i] = pars[count,3]            
+            count += 1
+            
+    # Fit trace coefficients
+    for tr in tracelist:
+        tr['tcoef'] = None
+        tr['xmin'] = np.min(tr['xvalues'])-tr['nbin']//2
+        tr['xmax'] = np.max(tr['xvalues'])+tr['nbin']//2
+        xt = np.array(tr['xvalues'])
+        # Trace Y-position
+        yt = tr['gycenter']
+        norder = 3
+        coef = np.polyfit(xt,yt,norder)
+        resid = yt-np.polyval(coef,xt)
+        std = np.std(resid)
+        # Check if we need to go to 4th order
+        if std>0.1:
+            norder = 4
+            coef = np.polyfit(xt,yt,norder)
+            resid = yt-np.polyval(coef,xt)
+            std = np.std(resid)
+        # Check if we need to go to 5th order
+        if std>0.1:
+            norder = 5
+            coef = np.polyfit(xt,yt,norder)
+            resid = yt-np.polyval(coef,xt)
+            std = np.std(resid)
+        tr['tcoef'] = coef
+        tr['tstd'] = std
+        # Fit Gaussian sigma as well
+        syt = tr['gysigma']
+        norder = 2
+        coef = np.polyfit(xt,syt,norder)
+        resid = syt-np.polyval(coef,xt)
+        std = np.std(resid)
+        # Check if we need to go to 3rd order
+        if std>0.05:
+            norder = 3
+            coef = np.polyfit(xt,syt,norder)
+            resid = syt-np.polyval(coef,xt)
+            std = np.std(resid)
+        # Check if we need to go to 4th order
+        if std>0.05:
+            norder = 4
+            coef = np.polyfit(xt,syt,norder)
+            resid = syt-np.polyval(coef,xt)
+            std = np.std(resid)
+        tr['sigcoef'] = coef
+        tr['sigstd'] = std
+        
+    return tracelist
+    
+def hornetrace(im,x=None,y=None,ytrace=None,err=None,off=10,backoff=50,smlen=31):
     """
     Fit spectral trace and PSF using the Horne 1986 method.
+    The input image should only include one spectrum/trace.
 
     Parameters
     ----------
@@ -150,7 +1200,7 @@ def hornefit(im,x=None,y=None,nbin=50):
     Example
     -------
 
-    psf = hornefit(im,x,y):
+    psf = hornetrace(im,x,y):
 
     """
 
@@ -160,12 +1210,77 @@ def hornefit(im,x=None,y=None,nbin=50):
     if y is None:
         y = np.arange(ny)
 
-    xmed,medim,peaks,pmask,xindex = traceim(im)
+    # Find the trace
+    if ytrace is None:
+        xmed,medim,smedim,peaks,pmask,xpind,ypind,xindex = traceim(im)        
+        tracelist = tracematch(xmed,medim,smedim,peaks,pmask,xpind,ypind,xindex)
+        if len(tracelist)>1:
+            medheights = [np.median(t['heights']) for t in tracelist]
+            bestind = np.argmax(medheights)
+            tr = tracelist[bestind]
+        else:
+            tr = tracelist[0]
+        tcoef = np.polyfit(tr['xvalues'],tr['yvalues'],3)
+        ytrace = np.polyval(tcoef,np.arange(nx))
+        # Get Gaussian parameters for all profiles at once
+        pars = gpars(xprofiles,profiles)
 
+    ## Figure out how many pixel to use in the profile
+    #maxsigma = np.max(tr['gysigma'])
+    #if nprofile is None:
+    #    # want 2.0*sigma on each side
+    #    nprofile = int(np.ceil(4*maxsigma))
+    #    if nprofile % 2 != 0:
+    #        nprofile += 1
+    #else:
+    #    # Make sure nprofile is even
+    #    if nprofile % 2 != 0:
+    #        nprofile += 1
+    #nhalf = nprofile//2
+        
+    yest = np.nanmedian(ytrace)
+    # Get the subimage
+    yblo = int(np.maximum(yest-backoff,0))
+    ybhi = int(np.minimum(yest+backoff,ny))
+    nback = ybhi-yblo
+    # Background subtract
+    med = np.nanmedian(im[yblo:ybhi,:],axis=0)
+    medim = np.zeros(nback).reshape(-1,1) + med.reshape(1,-1)
+    subim = im[yblo:ybhi,:]-medim
+    subim = subim.astype(float)   # make sure they are float64    
+    if err is not None:
+        suberr = err[yblo:ybhi,:]
+        suberr = suberr.astype(float)            
+    # Mask other parts of the image
+    ylo = ytrace-off - yblo
+    yhi = ytrace+off - yblo
+    yy = np.arange(nback).reshape(-1,1)+np.zeros(nx)
+    mask = (yy >= ylo) & (yy <= yhi)
+    sim = subim*mask
+    if err is not None:
+        serr = suberr*mask
+        badpix = (serr <= 0)
+        serr[badpix] = 1e20
+    # Compute the profile/probability matrix from the image
+    tot = np.nansum(np.maximum(sim,0),axis=0)
+    tot[(tot<=0) | ~np.isfinite(tot)] = 1
+    psf1 = np.maximum(sim,0)/tot
+    psf = np.zeros(psf1.shape,float)
+    for i in range(nback):
+        psf[i,:] = dln.medfilt(psf1[i,:],smlen)
+        #psf[i,:] = utils.gsmooth(psf1[i,:],smlen)        
+    psf[(psf<0) | ~np.isfinite(psf)] = 0
+    totpsf = np.nansum(psf,axis=0)
+    totpsf[(totpsf<=0) | (~np.isfinite(totpsf))] = 1
+    psf /= totpsf
+    psf[(psf<0) | ~np.isfinite(psf)] = 0
+
+    return psf
     
-def marshfit(im,x=None,y=None,nbin=50):
+def marshtrace(im,x=None,y=None,nprofile=None,kind='medfilt',wings='gaussian'):
     """
     Fit spectral trace and PSF using the Marsh 1989 method.
+    The input image should only include one spectrum/trace.
 
     Parameters
     ----------
@@ -175,26 +1290,218 @@ def marshfit(im,x=None,y=None,nbin=50):
        The X-array for IM.
     y : numpy array, optional
        The Y-array for IM.
+    nprofile : int, optional
+       Y-profile size.  Default is None and it is determined by the Gaussian sigma.
+    kind : str, optional
+      Kind of description to use of the PSF: "poly" or "medfilt".  Default is "medfilt".
+    wings : str, optional
+      The type of wings to use: "gaussian", or "none".  Default is "gaussian".
 
     Returns
     -------
-    psf : numpy array
+    model : numpy array
        The 2D PSF image.
+    recmodel : numpy array
+       The 2D rectified PSF image.
+    coefarr : numpy array
+       The polynomial coefficients.  Only if kind is "poly".
 
     Example
     -------
 
-    psf = marshfit(im,x,y):
+    model,recmodel = marshtrace(im,x,y):
 
     """
 
+    # TO DO:
+    # -use input x/y arrays
+    # -background subtraction
+    # -gaussian wings
+    
     ny,nx = im.shape
     if x is None:
         x = np.arange(nx)
     if y is None:
         y = np.arange(ny)
 
-    xmed,medim,peaks,pmask,xindex = traceim(im)
+    # Find the trace
+    xmed,medim,smedim,peaks,pmask,xpind,ypind,xindex = traceim(im)        
+    tracelist = tracematch(xmed,medim,smedim,peaks,pmask,xpind,ypind,xindex)
+    if len(tracelist)>1:
+        medheights = [np.median(t['heights']) for t in tracelist]
+        bestind = np.argmax(medheights)
+        tr = [tracelist[bestind]]
+    tracelist = tracegauss(medim,tracelist)
+    tr = tracelist[0]
+    ytrace = np.polyval(tr['tcoef'],np.arange(nx))
+
+    # Figure out how many pixel to use in the profile
+    maxsigma = np.max(tr['gysigma'])
+    if nprofile is None:
+        # want 2.0*sigma on each side
+        nprofile = int(np.ceil(4*maxsigma))
+        if nprofile % 2 == 0:
+            nprofile += 1
+    else:
+        # Make sure nprofile is even
+        if nprofile % 2 == 0:
+            nprofile += 1
+    nhalf = nprofile//2
+    
+    
+    # -resample each column onto the integer rows
+    # -can fit polynomial to each row, just like Horne/Marshall method
+    # -to make the model, get the values on the integer rows, and then
+    #  resample onto the correct shifted values
+
+    #yest = np.nanmedian(ytrace)
+    ## Get the subimage
+    #yblo = int(np.maximum(yest-backoff,0))
+    #ybhi = int(np.minimum(yest+backoff,ny))
+    #nback = ybhi-yblo
+    ## Background subtract
+    #med = np.nanmedian(im[yblo:ybhi,:],axis=0)
+    #medim = np.zeros(nback).reshape(-1,1) + med.reshape(1,-1)
+    #subim = im[yblo:ybhi,:]-medim
+    #subim = subim.astype(float)   # make sure they are float64    
+    #off = 10
+    ## Mask other parts of the image
+    #ylo = ytrace-off - yblo
+    #yhi = ytrace+off - yblo
+    #yy = np.arange(nback).reshape(-1,1)+np.zeros(nx)
+    #mask = (yy >= ylo) & (yy <= yhi)
+    #sim = subim*mask
+
+    # Get the rectified profiles
+    profiles = np.zeros((tr['ncol'],nprofile),float)+np.nan
+    xprofiles = np.zeros((tr['ncol'],nprofile),float)
+    dxprofiles = np.zeros((tr['ncol'],nprofile),float)
+    xprofile = np.arange(-nhalf,nhalf+1)
+    yprofile = np.zeros((tr['ncol'],nprofile),float)
+    for i in range(tr['ncol']):
+        if tr['yvalues'][i]<nhalf:        # at bottom edge
+            ylo = 0
+            yhi = tr['yvalues'][i]+nhalf+1
+            lo = nprofile-(yhi-ylo)
+            hi = nprofile
+            yp = np.zeros(nprofile,float)+np.nan
+            yp[lo:hi] = medim[ylo:yhi,tr['xbvalues'][i]]                
+        elif tr['yvalues'][i]>(ny-nhalf-1):   # at top edge
+            ylo = tr['yvalues'][i]-nhalf
+            yhi = ny
+            lo = 0
+            hi = yhi-ylo
+            yp = np.zeros(nprofile,float)+np.nan
+            yp[lo:hi] = medim[ylo:yhi,tr['xbvalues'][i]]
+        else:
+            ylo = tr['yvalues'][i]-nhalf
+            yhi = tr['yvalues'][i]+nhalf+1
+            yp = medim[ylo:yhi,tr['xbvalues'][i]]
+        profiles[i,:] = yp
+        xp = np.arange(nprofile)+tr['yvalues'][i]-nhalf
+        xprofiles[i,:] = xp            
+        dxp = xp-np.polyval(tr['tcoef'],tr['xvalues'][i])
+        dxprofiles[i,:] = dxp
+        good = np.isfinite(yp)
+        yout = dln.interp(dxp[good],yp[good],xprofile,kind='quadratic',extrapolate=False)
+        yprofile[i,:] = yout  #/np.nansum(yout)
+
+    ngood = np.sum(np.isfinite(yprofile),axis=0)
+    goodrows, = np.where(ngood > 0.9*profiles.shape[0])
+    tot = np.sum(yprofile[:,goodrows],axis=1)
+    yprofile /= tot.reshape(-1,1)   # normalizing
+
+    from dlnpyutils import plotting as pl    
+    import pdb; pdb.set_trace()
+    
+    # Fit each rectified row
+    #   with polynomial or median filter
+    coefarr = np.zeros((nprofile,6),float)
+    recmodel = np.zeros((nprofile,nx),float)
+    xx = np.arange(nx)
+    for i in range(nprofile):
+        good = np.isfinite(yprofile[:,i])
+        if np.sum(good)>0.5*tr['ncol']:
+            xp = np.array(tr['xvalues'])[good]
+            yp = yprofile[good,i]
+            # Median filter
+            if kind.lower()=='medfilt':
+                medpsf1 = dln.medfilt(yp,7)
+                # need to extrapolate to the ends
+                yout = dln.interp(xp,medpsf1,xx,kind='quadratic',extrapolate=True)
+                recmodel[i,:] = yout
+            # Polynomial fitting
+            elif kind.lower()=='poly' or kind.lower()=='polynomial':
+                medy = median_filter(yp,7)
+                # calculate average sigma so chisq~Npoints
+                # also, the rms
+                sig = np.sqrt(np.sum((yp-medy)**2)/len(yp))
+                rms = np.zeros(5,float)
+                chisq = np.zeros(5,float)
+                coef = np.zeros((5,6),float)
+                bic = np.zeros(5,float)
+                pv = np.zeros(5,float)
+                for j in range(5):
+                    coef[j,-(j+2):] = np.polyfit(xp,yp,j+1)
+                    mp = np.polyval(coef[j,:],xp)
+                    rms[j] = np.sqrt(np.mean((yp-mp)**2))
+                    chisq[j] = np.sum((yp-mp)**2/sig**2)
+                    lnl = -0.5*np.sum((yp-mp)**2/sig**2)-np.pi*len(yp)
+                    bic[j] = (j+2)*np.log(len(yp))-2*lnl
+                    pv[j] = stats.distributions.chi2.sf(chisq[j],i+2)
+                bestind = np.argmin(bic)
+                coefarr[i,:] = coef[bestind,:]
+                recmodel[i,:] = np.polyval(coef[bestind,:],xx)
+
+                # Use Bayesian Information Criterion (BIC)
+                #  to decide which order to use
+                # BIC = k*ln(n) - 2*ln(L)
+                # k = number of model parameters
+                # n = number of data points
+                # L = the maximized value of the likelihood function of the model
+                #   = -0.5*chisq - 0.5*Sum(2*pi*sigma_i**2)
+                
+            else:
+                raise ValueError(str(kind)+' not supported')
+
+    from dlnpyutils import plotting as pl
+    import pdb; pdb.set_trace()
+            
+    # Normalize
+    recmodel /= np.sum(recmodel,axis=0).reshape(1,-1)
+    
+    # Now make the full model
+    model = np.zeros((ny,nx),float)
+    for i in range(nx):
+        ymid = np.polyval(tr['tcoef'],xx[i])
+        if ymid<nhalf:        # at bottom edge
+            ylo = 0
+            yhi = int(np.round(ymid)+nhalf+1)
+            lo = nprofile-(yhi-ylo+1)
+            hi = nprofile
+        elif ymid>(ny-nhalf-1):   # at top edge
+            ylo = int(nhalf-np.round(ymid))
+            yhi = ny
+            lo = 0
+            hi = yhi-ylo+1
+        else:
+            ylo = int(np.round(ymid)-nhalf)  # index into full 2D array
+            yhi = int(np.round(ymid)+nhalf+1)
+            lo = 0                       # index for 9-hight recmodel array
+            hi = nprofile
+
+        xp = np.arange(ylo,yhi)
+        dxp = xp-ymid
+        yout = dln.interp(xprofile[lo:hi],recmodel[lo:hi,i],dxp,kind='quadratic',
+                          extrapolate=False,fill_value=0.0)
+        model[ylo:yhi,i] = yout
+
+    if kind.lower()=='medfilt':
+        return model,recmodel
+    elif kind.lower()=='poly' or kind.lower()=='polynomial':
+        return model,recmodel,coefarr      
+
+        
     
 class Traces():
     """
@@ -874,162 +2181,6 @@ class Trace():
         pts = self()
         plt.plot(pts[:,0],pts[:,1],**kwargs)
 
-@njit
-def quadratic_coefficients(x,y):
-    """ Calculate the quadratic coefficients from the three points."""
-    #https://www.azdhs.gov/documents/preparedness/state-laboratory/lab-licensure-certification/technical-resources/
-    #    calibration-training/12-quadratic-least-squares-regression-calib.pdf
-    #quadratic regression statistical equation
-    # y = ax**2 + b*x + c
-    n = len(x)
-    Sxx = np.sum(x**2) - np.sum(x)**2/n
-    Sxy = np.sum(x*y) - np.sum(x)*np.sum(y)/n
-    Sxx2 = np.sum(x**3) - np.sum(x)*np.sum(x**2)/n
-    Sx2y = np.sum(x**2 * y) - np.sum(x**2)*np.sum(y)/n
-    Sx2x2 = np.sum(x**4) - np.sum(x**2)**2/n
-    # a = ( S(x^2*y)*S(xx)-S(xy)*S(xx^2) ) / ( S(xx)*S(x^2x^2) - S(xx^2)^2 )
-    # b = ( S(xy)*S(x^2x^2) - S(x^2y)*S(xx^2) ) / ( S(xx)*S(x^2x^2) - S(xx^2)^2 )
-    denom = Sxx*Sx2x2 - Sxx2**2
-    if denom==0:
-        return [np.nan,np.nan,np.nan]
-    a = ( Sx2y*Sxx - Sxy*Sxx2 ) / denom
-    b = ( Sxy*Sx2x2 - Sx2y*Sxx2 ) / denom
-    c = np.median(y - (a*x**2+b*x))
-    coef = [a,b,c]
-    return coef
-        
-@njit
-def gvals(ycen,ysigma,y):
-    """
-    Calculate Gaussians in list.
-    """
-    nx = len(ycen)
-    ny = len(y)
-    model = np.zeros((ny,nx),float)
-    fac = np.sqrt(2*np.pi)
-    for i in range(nx):
-        #  Gaussian area is A = ht*wid*sqrt(2*pi)
-        # sigma = np.maximum( totflux/(ht0*np.sqrt(2*np.pi))
-        amp = 1/(fac*ysigma[i])
-        model[:,i] = amp*np.exp(-0.5*(y-ycen[i])**2/ysigma[i]**2)
-    return model
-
-@njit
-def gpars1(x,y):
-    """
-    Simple Gaussian fit to central 5 pixel values.
-
-    Parameters
-    ----------
-    x : numpy array
-       Numpy array of x-values.
-    y : numpy array
-       Numpy array of flux values.  Can be a single or
-       mulitple profiles.  If mulitple profiles, the dimensions
-       should be [Nprofiles,5].
-
-    Returns
-    -------
-    pars : numpy array
-       Gaussian parameters [height, center, sigma].  If multiple
-       profiles are input, then the output dimensions are [Nprofiles,3].
-
-    Example
-    -------
-    
-    pars = gpars1(x,y)
-
-    """
-    pars = np.zeros(3,float)
-    nx = len(y)
-    nhalf = nx//2
-    gd = (np.isfinite(y) & (y>0))
-    #if np.sum(gd)<5:
-    x = x[gd]
-    y = y[gd]
-    totflux = np.sum(y)
-    ht0 = y[nhalf]
-    if np.isfinite(ht0)==False:
-        ht0 = np.max(y)
-    # Use flux-weighted moment to get center
-    cen1 = np.sum(y*x)/totflux
-    #  Gaussian area is A = ht*wid*sqrt(2*pi)
-    sigma1 = np.maximum( totflux/(ht0*np.sqrt(2*np.pi)) , 0.01)
-    # Use linear-least squares to calculate height and sigma
-    psf = np.exp(-0.5*(x-cen1)**2/sigma1**2)          # normalized Gaussian
-    wtht = np.sum(y*psf)/np.sum(psf*psf)          # linear least squares
-
-    # Directly solve for the parameters using ln(y)
-    lny = np.log(y)
-    quadcoef = quadratic_coefficients(x-cen1,lny)
-    # a = -1/(2*sigma**2)   ->   sigma=sqrt(-1/(2*a))
-    # b = x0/sigma**2       ->   x0=b*sigma**2
-    # c = -x0**2/(2*sigma**2) + lnA  ->  A=exp(c + x0**2/(2*sigma**2))
-    sigma = np.sqrt(-1/(2*quadcoef[0]))
-    x0 = quadcoef[1]*sigma**2
-    height = np.exp(quadcoef[2]+x0**2/(2*sigma**2))
-    
-    pars[:] = [height,cen1+x0,sigma] 
-    return pars
-    
-@njit
-def gpars(x,y):
-    """
-    Simple Gaussian fit to central pixel values.
-
-    Parameters
-    ----------
-    x : numpy array
-       Numpy array of x-values.
-    y : numpy array
-       Numpy array of flux values.  Can be a single or
-       mulitple profiles.  If mulitple profiles, the dimensions
-       should be [Nprofiles,5].
-
-    Returns
-    -------
-    pars : numpy array
-       Gaussian parameters [height, center, sigma].  If multiple
-       profiles are input, then the output dimensions are [Nprofiles,3].
-
-    Example
-    -------
-    
-    pars = gpars(x,y)
-
-    """
-    
-    if y.ndim==1:
-        nprofiles = 1
-        y = np.atleast_1d(y)
-    else:
-        nprofiles = y.shape[0]
-    nx = y.shape[1]
-    nhalf = nx//2
-    # Loop over profiles
-    pars = np.zeros((nprofiles,3),float)
-    for i in range(nprofiles):
-        # First try the central 5 pixels first        
-        x1 = x[i,2:7]
-        y1 = y[i,2:7]
-        gd = (np.isfinite(y1) & (y1>0))
-        if np.sum(gd)<5:
-            x1 = x1[gd]
-            y1 = y1[gd]
-        pars1 = gpars1(x1,y1)
-        # If sigma is too high, then expand to include more points     
-        if pars1[2]>2:
-            x1 = x[i,:]
-            y1 = y[i,:]
-            gd = (np.isfinite(y1) & (y1>0))
-            if np.sum(gd)<9:
-                x1 = x1[gd]
-                y1 = y1[gd]
-            pars1 = gpars1(x1,y1)            
-        # Put results in big array
-        pars[i,:] = pars1
-        
-    return pars
 
 def backvals(backpix):
     """ Estimate the median and sigma of background pixels."""
@@ -1040,16 +2191,21 @@ def backvals(backpix):
     lastsigback = 1e30
     done = False
     # Outlier rejection
+    count = 0
     while (done==False):
         gdback, = np.where(vals < (medback+3*sigback))
         vals = vals[gdback]
         medback = np.nanmedian(vals)
         sigback = dln.mad(vals)
+        if sigback <= 0.0:
+            sigback = np.std(vals)
         if np.abs(medback-lastmedback) < 0.01*lastmedback and \
            np.abs(sigback-lastsigback) < 0.01*lastsigback:
             done = True
+        if count>10: done = True
         lastmedback = medback
         lastsigback = sigback
+        count += 1
     return medback,sigback
 
 def trace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
@@ -1283,6 +2439,7 @@ def trace(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
                       'lost':False}
             itrace['index'] = len(tracelist)+1
             itrace['ncol'] = 1
+            itrace['nbin'] = nbin  # save the binning information            
             itrace['yvalues'].append(yleft[j])
             itrace['xbvalues'].append(xb)
             itrace['xvalues'].append(xmed[xb])                
