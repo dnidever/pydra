@@ -11,7 +11,7 @@ from scipy import stats
 from astropy.io import fits
 from scipy import ndimage
 from scipy.interpolate import interp1d
-from numba import njit
+from numba import njit,jit
 from dlnpyutils import utils as dln,robust,mmm,coords
 from matplotlib.path import Path
 import matplotlib.pyplot as plt
@@ -68,6 +68,20 @@ def quadratic_bisector(x,y):
     return -b/(2*a)
 
 @njit
+def unique(x):
+    """
+    Return the index of the unique values.
+    """
+    ind = np.array([0])
+    if len(x)>1:
+        si = np.argsort(x)
+        xs = x[si]
+        diff = xs[1:]-xs[:-1]
+        gstep, = np.where(diff!=0)
+        ind = np.concatenate((ind,gstep+1))
+    return ind
+    
+@njit
 def gvals(ycen,ysigma,y):
     """
     Calculate Gaussians in list.
@@ -101,6 +115,26 @@ def gaussian(x,coef):
         y += coef[3]
     return y
 
+@njit
+def bestscale(x,y):
+    """
+    Find the best scaling between x to y.
+    """
+    scale = np.sum(x*y)/np.sum(x**2)
+    return scale
+
+@njit
+def linregression(x,y):
+    """
+    Linear regression
+    """
+    # https://en.wikipedia.org/wiki/Simple_linear_regression
+    mnx = np.mean(x)
+    mny = np.mean(y)
+    slope = np.sum((x-mnx)*(y-mny))/np.sum((x-mnx)**2)
+    yoff = mny-slope*mnx
+    return slope,yoff
+    
 @njit
 def gparsmoments(x,y):
     """
@@ -141,14 +175,14 @@ def gparsmoments(x,y):
     return amp,cen,sigma
 
 @njit
-def gparspoly(usq,y):
+def gparsamppoly(usq,y):
     """
     Estimate Gaussian amplitude and offset using polynomial estimate.
 
     Parameters
     ----------
     usq : numpy array
-       Numpy array of the square of the shifted and scaled x-values, u=(x-cen)/sigma.
+       Numpy array of the square of the shifted and scaled x-values, usq=((x-cen)/sigma)^2.
     y : numpy array
        Numpy array of flux values.
 
@@ -162,7 +196,7 @@ def gparspoly(usq,y):
     Example
     -------
     
-    amp,offset = gparspoly(usq,y)
+    amp,offset = gparsamppoly(usq,y)
 
     """
     mny = np.mean(y)
@@ -180,6 +214,319 @@ def gparspoly(usq,y):
     # where the term in the parentheses is the X, A is the slope and offset is the constant term
     # we can then refine to get a better sigma
 
+    # Use initial centroid and sigma estimate to get Amplitude and offset
+    fact = f[0] + f[1]*usq + f[2]*usq**2  + f[3]*usq**3  + f[4]*usq**4
+    mnfact = np.mean(fact)
+    amp = (np.sum(fact*y)-mnfact*mny)/(np.sum(fact**2)-mnfact**2)
+    offset = amp*mnfact-mny
+    
+    return amp,offset
+
+@njit
+def gparssigmasearch_chisq(u,y,sigma):
+    # Scale y to get Amp and offset
+    yf = gaussian(u,np.array([1.0,0.0,sigma]))
+    # solve for Amp and offset
+    amp,off = linregression(yf,y)
+    model = yf*amp+off
+    residsq = (y-model)**2
+    chisq = np.sum(residsq)
+    return chisq
+
+@njit
+def gparssigmasearch(u,y):
+    """ 
+    Search a region of sigma finding the best chiqsq value.
+
+    Parameters
+    ----------
+    u : numpy array
+       Numpy array of the shifted x-values, u=|x-cen|.
+         NOT scaled by sigma.
+    y : numpy array
+       Numpy array of flux values.
+
+    Returns
+    -------
+    amp : float
+       The Gaussian amplitude value.
+    sigma : float
+       The Gaussian sigma value.
+    offset : float
+       The constant offset.
+    chisq : float
+       The best chisq value.
+
+    Example
+    -------
+    
+    amp,sigma,offset,chisq = gparssigmasearch(u,y)
+
+    """
+                  
+    # Pretty fast and robust
+    # 22 microseconds
+    
+    # Assume u extends to 3*sigma
+    usq = u**2
+    umax = np.max(np.abs(u))
+    sigma0 = umax/3.0
+
+    # Initialize large arrays to hold the chisq and sigma values
+    sigmaarr = np.zeros(100,float)    
+    chisqarr = np.zeros(100,float)
+    count = 0
+
+    # Get chisq of initial sigma value
+    chisq0 = gparssigmasearch_chisq(u,y,sigma0)
+    sigmaarr[count] = sigma0
+    chisqarr[count] = chisq0
+    count += 1
+    
+    # Find inner edge where chisq starts to increase
+    sigma = sigma0*0.75
+    last_chisq = chisq0
+    flag = 0
+    while (flag==0):
+        chisq = gparssigmasearch_chisq(u,y,sigma)
+        sigmaarr[count] = sigma
+        chisqarr[count] = chisq
+        count += 1
+        if chisq < last_chisq:
+            sigma *= 0.75
+        else:
+            flag = 1
+        last_chisq = chisq
+    low_sigma = sigma
+
+    # Find upper edge where chisq starts to increase
+    sigma = sigma0*1.25
+    last_chisq = chisq0
+    flag = 0
+    while (flag==0):
+        chisq = gparssigmasearch_chisq(u,y,sigma)
+        sigmaarr[count] = sigma
+        chisqarr[count] = chisq
+        count += 1
+        if chisq < last_chisq:
+            sigma *= 1.25
+        else:
+            flag = 1
+        last_chisq = chisq
+    high_sigma = sigma
+
+    # Trim the chisq/sigma values
+    sigmaarr = sigmaarr[0:count]
+    chisqarr = chisqarr[0:count]
+    # sort them
+    si = np.argsort(sigmaarr)
+    sigmaarr = sigmaarr[si]
+    chisqarr = chisqarr[si]
+
+    bestind = np.argmin(chisqarr)
+    # Fit quadratic equation to best value and neighboring points
+    sigma = quadratic_bisector(sigmaarr[bestind-1:bestind+2],
+                               chisqarr[bestind-1:bestind+2])
+
+    # Now get amp and offset
+    coef = np.zeros(3,float)  # numba is requiring me to do it this way
+    coef[0] = 1
+    coef[2] = sigma
+    yf = gaussian(u,coef)
+    # solve for Amp and offset
+    amp,offset = linregression(yf,y)
+    model = yf*amp+offset
+    residsq = (y-model)**2
+    chisq = np.sum(residsq)
+
+    return amp,sigma,offset,chisq
+
+@njit
+def gparspolyiter(u,y):
+    """
+    Iterate back and forth between scaling in u and scaling in y.
+
+    Parameters
+    ----------
+    u : numpy array
+       Numpy array of the shifted x-values, u=|x-cen|.
+         NOT scaled by sigma.
+    y : numpy array
+       Numpy array of flux values.
+
+    Returns
+    -------
+    amp : float
+       The Gaussian amplitude value.
+    sigma : float
+       The Gaussian sigma value.
+    offset : float
+       The constant offset.
+
+    Example
+    -------
+    
+    amp,sigma,offset = gparspolyiter(u,y)
+
+    """
+
+    # NOT GOOD
+    
+    # These are the Gaussian polynomial coefficients for the flux (A=1 and sigma=1) if given 
+    #  the sigma-scaled u squared, u^2 = ((x-cen)/sigma)^2
+    #  the usq values should only to up to 9, i.e. 3 sigma
+    # highest order FIRST
+    ycoef = np.array([ 3.78864533e-04, -9.77177326e-03,  9.79500447e-02, -4.74980034e-01,
+                       9.96182626e-01])
+
+    # These are the Gaussian polynomial coefficients that give u-squared from scaled y (0 to 1)
+    # highest orders FIRST
+    ucoef = np.array([ 3.26548205e+04, -1.74691753e+05,  4.02541663e+05, -5.22876009e+05,
+                       4.20862134e+05, -2.17473350e+05,  7.24096646e+04, -1.52451852e+04,
+                       1.96347765e+03, -1.55782907e+02,  1.03476392e+01])
+
+    # Assume u extends to 3*sigma
+    usq = u**2
+    umax = np.max(np.abs(u))
+    sigma = umax/3.0
+    
+    # Iterate until convergence
+    last_sigma = 1e10
+    last_amp = 1e10
+    last_off = 1e10
+    count = 0
+    flag = 0
+    while (flag==0):
+    
+        # Scale y to get Amp and offset
+        usclsq = (u/sigma)**2
+        yf = polyval(ycoef,usclsq)
+        # solve for Amp and offset
+        amp,off = linregression(yf,y)
+    
+        # Now scale in u to get sigma
+        yscl = (y-off)/amp
+        # Only include "high" values, lower values are more likely to be dominated by a constant offset
+        good = (yscl > 0.15)
+        # This should now follow the "standard curve" and usq is just scaled by sigma^2
+        # need to calculate the u-values for the "standard curve" for our y-values
+        usq_standard = polyval(ucoef,yscl[good])
+        # now calculate the least squares scaling factor
+        #scale = bestscale(usq[good],usq_standard)
+        #sigma = 1/np.sqrt(scale)
+        scale,y0 = linregression(usq[good],usq_standard)
+        sigma = 1/np.sqrt(scale)
+
+        # Parameter changes
+        delta_sigma = np.abs(sigma-last_sigma)/sigma*100
+        delta_amp = np.abs(amp-last_amp)/amp*100
+        delta_off = np.abs(off-last_off)/amp*100
+
+        # Convergence criteria
+        if (delta_sigma<1 and delta_amp<1 and delta_off<1) or count>10:
+            flag = 1
+
+        #print(count,amp,sigma,off)
+                     
+        # Save values for later
+        last_sigma = sigma
+        last_amp = amp
+        last_off = off
+
+        count += 1   # increment counter
+        
+    #import pdb; pdb.set_trace()
+
+    return amp,sigma,off
+
+#@njit
+def gparspoly(u,y):
+    """
+    Estimate Gaussian amplitude and offset using polynomial estimate.
+
+    Parameters
+    ----------
+    u : numpy array
+       Numpy array of the shifted x-values, u=(x-cen).
+         NOT scaled by sigma.
+    y : numpy array
+       Numpy array of flux values.
+
+    Returns
+    -------
+    amp : float
+       The Gaussian amplitude value.
+    sigma : float
+       The Gaussian sigma value.
+    offset : float
+       The constant offset.
+
+    Example
+    -------
+    
+    amp,offset = gparspoly(u,y)
+
+    """
+    n = len(y)
+    mny = np.mean(y)
+    
+    # These are the Gaussian polynomial coefficients for A=1 and sigma=1
+    # lowest order FIRST
+    f = np.array([ 9.96182626e-01, -4.74980034e-01,  9.79500447e-02, -9.77177326e-03,
+                   3.78864533e-04])
+    # y = offset + A*(f0 + f1*usq/sigma^2 + f2*usq^2/sigma^4 + f3*usq^3/sigma^6 + f4*usq^4/sigma^8)
+    #
+    # y = offset + A*(f0 + f1*(usq/sigma^2) + f2*(usq/sigma^2)^2 + f3*(usq/sigma^2)^3 + f4*(usq/sigma^2)^4)
+    # us = usq/sigma^2
+    # y = offset + A*(f + f1*us + f2*us^2 + f3*us^3 + f4*us^4)
+    # if we have an estimate for sigma, then we can solve for A and offset directly using linear OLS
+    # where the term in the parentheses is the X, A is the slope and offset is the constant term
+    # we can then refine to get a better sigma
+
+    # Fit 4th order polynomial coefficients using least-squares regression
+    usq = u**2
+    design = np.zeros((n,5),float)
+    design[:,0] = 1
+    design[:,1] = usq
+    design[:,2] = usq**2
+    design[:,3] = usq**3
+    design[:,4] = usq**4
+    # beta = (X.T * X)^-1 X.T y
+    beta = np.dot(np.linalg.inv(design.T @ design),np.dot(design.T,y))
+
+    # get multiple estimates of sigma from the higher order terms
+    # beta[1] = A*f1/sigma^2
+    # beta[2] = A*f2/sigma^4
+    # beta[1]/beta[2]=sigma^2 * f1/f2
+    #  sigma = np.sqrt(beta[1]/beta[2]*f2/f1)
+    sigma12 = np.sqrt(beta[1]/beta[2]*f[2]/f[1])
+    
+    # Now use polynomial least-squares regression to get sigma
+    # a = 1/sigma^2
+    # beta[1] = A*f1*a
+    # beta[2] = A*f2*a^2
+    # beta[3] = A*f3*a^3
+    # beta[4] = A*f4*a^4
+    # divide by f and then by beta[1]
+    # fbeta = beta[1:]/f[1:]
+    # fbeta[0] = A*a
+    # fbeta[1] = A*a^2
+    # fbeta[2] = A*a^3
+    # fbeta[3] = A*a^4
+    # and then divide by beta2[0] to get rid of Amp
+    # fabeta = fbeta[1:]/fbeta[0]
+    # fabeta[1] = a
+    # fabeta[2] = a^2
+    # fabeta[3] = a^3    
+    fbeta = beta[1:]/f[1:]
+    fabeta = fbeta[1:]/fbeta[0]
+
+    # a = 1/sigma^2
+    # y = offset + A*(f0 + f1*a*usq + f2*a^2*usq^2 + f3*a^3*usq^3 + f4*a^4*usq^4)
+    ampsigprod = beta[1]/f[1]  # A*a
+
+    # I CAN'T FIND A SOLUTION FOR THIS
+    
     # Use initial centroid and sigma estimate to get Amplitude and offset
     fact = f[0] + f[1]*usq + f[2]*usq**2  + f[3]*usq**3  + f[4]*usq**4
     mnfact = np.mean(fact)
@@ -388,7 +735,7 @@ def gparsampdiffs(u,y):
 
     """
 
-    # This method is quite robust
+    # This method is quite robust, as long as you have a decent sigma estimate
     
     # Use flux differences (then the offset drops out) between pixels near the peak
     #  to estimate the amplitude and constant offset
@@ -503,7 +850,7 @@ def gparsmodelscale(x,y,coef):
     yoff = mny-slope*mnx
     return slope,yoff
     
-#@njit
+@njit
 def gpars1(x,y):
     """
     Simple Gaussian fit using 8th order polynomial estimate.
@@ -528,7 +875,7 @@ def gpars1(x,y):
 
     """
 
-    # This takes about 40 microseconds for 10 points
+    # This takes about 85 microseconds for 10 points
     
     yp = np.maximum(y,0)
     good, = np.where(np.isfinite(y))
@@ -541,15 +888,15 @@ def gpars1(x,y):
     # Use moments to get first estimates, then iterate
     # subtract minimum in case there is an offset
     # fast: 2 microseconds
-    amp0,cen0,sig0 = gparsmoments(xp,yp)
-    good = ((np.abs(x-cen0) <= 3*sig0) & np.isfinite(y))
+    amp0,cen0,sigma0 = gparsmoments(xp,yp)
+    good = ((np.abs(x-cen0) <= 3*sigma0) & np.isfinite(y))
     # Re-estimate center and sigma with reduced range
     #  only if the range changed a lot
     if len(yp)/np.sum(good) > 1.5:
-        amp0,cen0,sig0 = gparsmoments(x[good],yp[good])
+        amp0,cen0,sigma0 = gparsmoments(x[good],yp[good])
     # Our Gaussian might be truncated on one side
-    nxsigpos = ((np.max(x[good])-cen0)/sig0)
-    nxsigneg = ((cen0-np.min(x[good]))/sig0)
+    nxsigpos = ((np.max(x[good])-cen0)/sigma0)
+    nxsigneg = ((cen0-np.min(x[good]))/sigma0)
     if nxsigpos<0 or nxsigneg<0 or nxsigpos<2 or nxsigneg<2 or np.abs(nxsigpos-nxsigneg)>0.5:
         # Reflect points about the maximum
         x2 = np.concatenate((xp-xmax,xmax-xp))+xmax
@@ -559,51 +906,78 @@ def gpars1(x,y):
         x2,y2 = x2[si],y2[si]
         # Need to get unique x-values, otherwise the amplitude will be artificially
         #  inflated because we added more points
-        _,ui = np.unique(x2,return_index=True)
+        #_,ui = np.unique(x2,return_index=True)
+        ui = unique(x2) 
         x2,y2 = x2[ui],y2[ui]
-        amp,cen0,sig0 = gparsmoments(x2,y2)
-        good = ((np.abs(x-cen0) <= 3*sig0) & np.isfinite(y))
+        amp,cen0,sigma0 = gparsmoments(x2,y2)
+        good = ((np.abs(x-cen0) <= 3*sigma0) & np.isfinite(y))
         
     xp = x[good]
     yp = y[good]
     u0 = (xp-cen0)**2
+    
+    # Use sigma search
+    u0 = np.abs(xp-cen0)
+    amp1,sigma1,offset1,chisq1 = gparssigmasearch(u0,yp)
 
-    # If there is an appreciable constant offset
-    # moments: gives good center
+    # Improve center estimate with cross-correlation
+    # somewhat slower: 24 microseconds
+    coef1 = np.zeros(4,float)
+    coef1[0] = amp1
+    coef1[1] = cen0
+    coef1[2] = sigma1
+    coef1[3] = offset1
+    cen1 = gaussxccenter(xp,yp,coef1)
+    
+    # Iterate: Use sigma search
+    u1 = np.abs(xp-cen1)
+    amp2,sigma2,offset2,chisq2 = gparssigmasearch(u1,yp)   
 
+    # Make sure new solution is better
+    coef = np.zeros(4,float)
+    if chisq2 <= chisq1:
+        coef[0] = amp2
+        coef[1] = cen1
+        coef[2] = sigma2
+        coef[3] = offset2
+    # New solution is worse, revert to prevous one
+    else:
+        coef[0] = amp1
+        coef[1] = cen0
+        coef[2] = sigma1
+        coef[3] = offset1
+    
     # Get initial estimate of amplitude and offset from flux differences
     # fast, 12 micro seconds
-    A0,offset0 = gparsampdiffs(np.abs(xp-cen0)/sig0,yp)
+    #A0,offset0 = gparsampdiffs(np.abs(xp-cen0)/sig0,yp)
     
     # Use Gaussian polynomial approximation to estimate amplitude and offset
     #A0,offset0 = gparspoly(u0/sig0**2,yp)
     
     # Get improved sigma estimate using u/y scaling
     # fast: 12 microseconds
-    sig1 = gparssigmascale(u0,(yp-offset0)/A0)
+    #sig1 = gparssigmascale(u0,(yp-offset0)/A0)
     
     # Iterate: Re-estimate center with cross-correlation
     # somewhat slower: 24 microseconds
-    coef0 = np.array([A0,cen0,sig1,offset0])
-    cen1 = gaussxccenter(xp,yp,coef0)
-    u1 = (xp-cen1)**2
+    #coef0 = np.array([A0,cen0,sig1,offset0])
+    #cen1 = gaussxccenter(xp,yp,coef0)
+    #u1 = (xp-cen1)**2
     
     # Iterate: Re-estimate A and offset with the improved sigma value
-    #A1,offset1 = gparspoly(u1/sig1**2,yp)
-    A1,offset1 = gparsampdiffs(np.abs(xp-cen1)/sig1,yp)
+    ##A1,offset1 = gparspoly(u1/sig1**2,yp)
+    #A1,offset1 = gparsampdiffs(np.abs(xp-cen1)/sig1,yp)
     # doesn't improve really
     
     # fit amplitude and offset by using a linear fit of the model
     # (slope is the amplitude and y-offset is the offset term)
     # fast: 2 microseconds
-    tcoef = np.array([1.0,cen1,sig1])
-    A2,offset2 = gparsmodelscale(xp,yp,tcoef)
+    #tcoef = np.array([1.0,cen1,sig1])
+    #A2,offset2 = gparsmodelscale(xp,yp,tcoef)
     # doesn't improve really
 
-    import pdb; pdb.set_trace()
+    return coef
     
-    return A2,cen1,sig1,offset2
-
 @njit
 def gpars1log(x,y):
     """
@@ -652,20 +1026,21 @@ def gpars1log(x,y):
 
     return pars
 
-#@njit
-def gpars(x,y):
+@njit
+def gpars(xprofiles,yprofiles,npixprofiles):
     """
     Simple Gaussian fit to central pixel values.
 
     Parameters
     ----------
-    x : numpy array
+    xprofiles : numpy array
        Numpy array of x-values.
-    y : numpy array
+    yprofiles : numpy array
        Numpy array of flux values.  Can be a single or
        mulitple profiles.  If mulitple profiles, the dimensions
        should be [Nprofiles,5].
-
+    
+    
     Returns
     -------
     pars : numpy array
@@ -679,41 +1054,107 @@ def gpars(x,y):
 
     """
     
-    if y.ndim==1:
-        nprofiles = 1
-        y = np.atleast_1d(y)
-    else:
-        nprofiles = y.shape[0]
-    nx = y.shape[1]
-    nhalf = nx//2
+    #if y.ndim==1:
+    #    nprofiles = 1
+    #    y = np.atleast_1d(y)
+    #else:
+    #    nprofiles = y.shape[0]
+    #nx = y.shape[1]
+    #nhalf = nx//2
+    nprofiles = len(npixprofiles)
     # Loop over profiles
     pars = np.zeros((nprofiles,4),float)
     for i in range(nprofiles):
         # First try the central 5 pixels first        
         #x1 = x[i,2:7]
         #y1 = y[i,2:7]
-        x1 = x[i,:]
-        y1 = y[i,:]        
-        gd = (np.isfinite(y1) & (y1>0))
-        if np.sum(gd)<5:
-            x1 = x1[gd]
-            y1 = y1[gd]
+        #x1 = x[i,:]
+        #y1 = y[i,:]
+        #x1 = profiles[i]['x']
+        #y1 = profiles[i]['y']
+        npix = npixprofiles[i]
+        x1 = xprofiles[i,:npix]
+        y1 = yprofiles[i,:npix]
+        #gd = (np.isfinite(y1) & (y1>0))
+        #if np.sum(gd)<5:
+        #    x1 = x1[gd]
+        #    y1 = y1[gd]
         pars1 = gpars1(x1,y1)
         # If sigma is too high, then expand to include more points     
-        if pars1[2]>2:
-            x1 = x[i,:]
-            y1 = y[i,:]
-            gd = (np.isfinite(y1) & (y1>0))
-            if np.sum(gd)<9:
-                x1 = x1[gd]
-                y1 = y1[gd]
-            pars1 = gpars1(x1,y1)
+        #if pars1[2]>2:
+        #    x1 = x[i,:]
+        #    y1 = y[i,:]
+        #    gd = (np.isfinite(y1) & (y1>0))
+        #    if np.sum(gd)<9:
+        #        x1 = x1[gd]
+        #        y1 = y1[gd]
+        #    pars1 = gpars1(x1,y1)
         # Put results in big array
         pars[i,:] = pars1
-        import pdb; pdb.set_trace()
         
     return pars
 
+@njit
+def traceboundary(y,cen):
+    """
+    Find the boundary of the trace.
+    Can be where the values start to increase again, or
+    hit the edge of the array
+    """
+
+    n = len(y)
+    peak = y[cen]
+    
+    # Walk to lower boundary
+    flag = 0
+    count = 0
+    last_y = peak
+    last_position = cen
+    position = cen-1
+    while (flag==0):
+        y1 = y[position]        
+        # need to stop
+        if y1<0.5*peak and y1>=last_y:
+            flag = 1
+            low = position+1
+        # at lower edge, stop
+        elif position==0:
+            flag = 1
+            low = position
+        # keep going
+        else:
+            position -= 1
+        count += 1   # increment counter
+        # keep last values
+        last_y = y1
+        last_position = position
+        
+    # Walk to upper boundary
+    flag = 0
+    count = 0
+    last_y = peak
+    last_position = cen
+    position = cen+1
+    while (flag==0):
+        y1 = y[position]
+        # need to stop
+        if y1<0.5*peak and y1>=last_y:
+            flag = 1
+            high = position-1
+        elif position==n-1:
+            flag = 1
+            high = position
+        # keep going
+        else:
+            position += 1
+        count += 1   # increment counter
+        # keep last values
+        last_y = y1
+        last_position = position
+    
+    return low,high
+
+        
 def traceim(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
             neifluxratio=0.3,verbose=False):
     """
@@ -767,6 +1208,7 @@ def traceim(im,nbin=50,minsigheight=3,minheight=None,hratio2=0.97,
     xmed,medim,peaks,pmask,xpind,ypind,xindex = traceim(im)
 
     """
+    im = im.astype(float)  # make sure it is float64, needed for njit to work right sometimes
     # This assumes that the dispersion direction is along the X-axis
     #  Y-axis is spatial dimension
     ny,nx = im.shape
@@ -1089,32 +1531,50 @@ def tracegauss(medim,tracelist):
     
     # Calculate Gaussian parameters
     nprofiles = np.sum([tr['ncol'] for tr in tracelist])
-    profiles = np.zeros((nprofiles,9),float) + np.nan  # all bad to start
-    xprofiles = np.zeros((nprofiles,9),int)
+    yprofiles = np.zeros((nprofiles,50),float) + np.nan  # all bad to start
+    xprofiles = np.zeros((nprofiles,50),int)
+    npixprofiles = np.zeros(nprofiles,int)
+    profiles = []
     trindex = np.zeros(nprofiles,int)
     count = 0
     for t,tr in enumerate(tracelist):
         for i in range(tr['ncol']):
-            if tr['yvalues'][i]<4:        # at bottom edge
-                lo = 4-tr['yvalues'][i]
-                yp = np.zeros(9,float)+np.nan
-                yp[lo:] = medim[:tr['yvalues'][i]+5,tr['xbvalues'][i]]                
-            elif tr['yvalues'][i]>(ny-5):   # at top edge
-                hi = 9-(ny-tr['yvalues'][i])+1
-                yp = np.zeros(9,float)+np.nan
-                yp[:hi] = medim[tr['yvalues'][i]-4:,tr['xbvalues'][i]]
-            else:
-                lo = tr['yvalues'][i]-4
-                hi = tr['yvalues'][i]+5
-                yp = medim[lo:hi,tr['xbvalues'][i]]
-            profiles[count,:] = yp
-            xp = np.arange(9)+tr['yvalues'][i]-4            
-            xprofiles[count,:] = xp
+            xlo,xhi = traceboundary(medim[:,tr['xbvalues'][i]],tr['yvalues'][i])
+            #if tr['yvalues'][i]<4:        # at bottom edge
+            #    lo = 4-tr['yvalues'][i]
+            #    yp = np.zeros(9,float)+np.nan
+            #    yp[lo:] = medim[:tr['yvalues'][i]+5,tr['xbvalues'][i]]                
+            #elif tr['yvalues'][i]>(ny-5):   # at top edge
+            #    hi = 9-(ny-tr['yvalues'][i])+1
+            #    yp = np.zeros(9,float)+np.nan
+            #    yp[:hi] = medim[tr['yvalues'][i]-4:,tr['xbvalues'][i]]
+            #else:
+            #    lo = tr['yvalues'][i]-4
+            #    hi = tr['yvalues'][i]+5
+            #    yp = medim[lo:hi,tr['xbvalues'][i]]
+            #profiles[count,:] = yp
+            #xp = np.arange(9)+tr['yvalues'][i]-4            
+            #xprofiles[count,:] = xp
             trindex[count] = t
+            xp = np.arange(xlo,xhi+1)
+            yp = medim[xlo:xhi+1,tr['xbvalues'][i]]
+            npix = len(xp)
+            xprofiles[i,:npix] = xp
+            yprofiles[i,:npix] = yp
+            npixprofiles[i] = npix
+            #prof1 = {'x':np.arange(xlo,xhi+1),
+            #         'y':medim[xlo:xhi+1,tr['xbvalues'][i]],'index':t}
+            #profiles.append(prof1)
             count += 1
-            
+
+    # Trim the arrays
+    maxnpix = np.max(npixprofiles)
+    xprofiles = xprofiles[:,:maxnpix]
+    yprofiles = yprofiles[:,:maxnpix]
+
     # Get Gaussian parameters for all profiles at once
-    pars = gpars(xprofiles,profiles)
+    #pars = gpars(xprofiles,profiles)
+    pars = gpars(xprofiles,yprofiles,npixprofiles)
     # Stuff the Gaussian parameters into the list
     count = 0
     for tr in tracelist:
