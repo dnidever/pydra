@@ -186,6 +186,86 @@ def linregression(x,y):
     return slope,yoff
 
 @njit
+def peakboundary(y,cen):
+    """
+    Find the boundary of the peak.
+    Can be where the values start to increase again, or
+    hit the edge of the array
+
+    Parameters
+    ----------
+    y : numpy array
+       Numpy array of the peak flux array.
+    cen : float
+       Estimate of the peak center.
+
+    Returns
+    -------
+    low : int
+       Index of the lower edge of the peak.
+    high : int
+       Index of the upper edge of the peak.
+
+    Example
+    -------
+
+    low,high = peakboundary(y,cen)
+
+    """
+
+    n = len(y)
+    peak = y[cen]
+    
+    # Walk to lower boundary
+    flag = 0
+    count = 0
+    last_y = peak
+    last_position = cen
+    position = cen-1
+    while (flag==0):
+        y1 = y[position]        
+        # need to stop
+        if y1<0.5*peak and y1>=last_y:
+            flag = 1
+            low = position+1
+        # at lower edge, stop
+        elif position==0:
+            flag = 1
+            low = position
+        # keep going
+        else:
+            position -= 1
+        count += 1   # increment counter
+        # keep last values
+        last_y = y1
+        last_position = position
+        
+    # Walk to upper boundary
+    flag = 0
+    count = 0
+    last_y = peak
+    last_position = cen
+    position = cen+1
+    while (flag==0):
+        y1 = y[position]
+        # need to stop
+        if y1<0.5*peak and y1>=last_y:
+            flag = 1
+            high = position-1
+        elif position==n-1:
+            flag = 1
+            high = position
+        # keep going
+        else:
+            position += 1
+        count += 1   # increment counter
+        # keep last values
+        last_y = y1
+        last_position = position
+    
+    return low,high
+
+@njit
 def gparscenpeak(y):
     """
     Estimate central position using the maximum point and
@@ -204,7 +284,7 @@ def gparscenpeak(y):
     Example
     -------
     
-    cen = gparsmoments(y)
+    cen = gparscenpeak(y)
 
     """
 
@@ -405,7 +485,20 @@ def gparssigmasearch(u,y):
     sigmaarr = sigmaarr[si]
     chisqarr = chisqarr[si]
 
+    # Get two more points by the minimum
     bestind = np.argmin(chisqarr)
+    sigmalo = 0.5*(sigmaarr[bestind-1]+sigmaarr[bestind])
+    chisqlo = gparssigmasearch_chisq(u,y,sigmalo)
+    sigmahi = 0.5*(sigmaarr[bestind]+sigmaarr[bestind+1])    
+    chisqhi = gparssigmasearch_chisq(u,y,sigmahi)
+    sigmaarr = np.concatenate((sigmaarr,np.array([sigmalo,sigmahi])))
+    chisqarr = np.concatenate((chisqarr,np.array([chisqlo,chisqhi])))
+    # sort again
+    si = np.argsort(sigmaarr)
+    sigmaarr = sigmaarr[si]
+    chisqarr = chisqarr[si]    
+    bestind = np.argmin(chisqarr)
+    
     # Fit quadratic equation to best value and neighboring points
     sigma = quadratic_bisector(sigmaarr[bestind-1:bestind+2],
                                chisqarr[bestind-1:bestind+2])
@@ -424,12 +517,14 @@ def gparssigmasearch(u,y):
     return amp,sigma,offset,chisq
 
 @njit
-def gparscenbisector(y,cen):
+def gparscenbisector(x,y,cen):
     """
     Use the symmetry of the curve to find the center
 
     Parameters
     ----------
+    x : numpy array
+       Numpy array of x-values.
     y : numpy array
        Numpy array of flux values.
     cen : float
@@ -443,7 +538,7 @@ def gparscenbisector(y,cen):
     Example
     -------
     
-    cen = gparscenbisector(y,cen)
+    cen = gparscenbisector(x,y,cen)
 
     """
 
@@ -451,14 +546,13 @@ def gparscenbisector(y,cen):
     # Central pixel to start with
     xstart = int(np.ceil(cen))
 
-    # The basic idea is that I want to find the bisector
-    # of the peak
-    # For each pixel on one side, I want to find the expected position at the same
+    # Find the bisector of the peak
+    # For each pixel on one side, find the expected position at the same
     # flux level on the other side
     ind = np.arange(n)
     left = (ind < cen)
-    xleft = ind[left]
-    xright = ind[~left]
+    xleft = x[left]
+    xright = x[~left]
     yleft = y[left]
     yright = y[~left]
     # flip right values so they are ascending
@@ -1057,7 +1151,8 @@ def gpars1(x,y):
     """
 
     # This takes about 85 microseconds for 10 points
-    
+
+    dx = x[1]-x[0]
     yp = np.maximum(y,0)
     good, = np.where(np.isfinite(y))
     xp = x[good]
@@ -1065,42 +1160,35 @@ def gpars1(x,y):
     ymax = np.max(yp)
     ymin = np.min(yp)
     xmax = xp[np.argmax(yp)]
+    
+    # Use peak to get first estimate of center
+    xcen0 = gparscenpeak(yp)
 
-    # Use moments to get first estimates, then iterate
-    # subtract minimum in case there is an offset
-    # fast: 2 microseconds
-    amp0,cen0,sigma0 = gparsmoments(xp,yp)
-    good = ((np.abs(x-cen0) <= 3*sigma0) & np.isfinite(y))
-    # Re-estimate center and sigma with reduced range
-    #  only if the range changed a lot
-    if len(yp)/np.sum(good) > 1.5:
-        amp0,cen0,sigma0 = gparsmoments(x[good],yp[good])
-    # Our Gaussian might be truncated on one side
-    nxsigpos = ((np.max(x[good])-cen0)/sigma0)
-    nxsigneg = ((cen0-np.min(x[good]))/sigma0)
-    if nxsigpos<0 or nxsigneg<0 or nxsigpos<2 or nxsigneg<2 or np.abs(nxsigpos-nxsigneg)>0.5:
-        # Reflect points about the maximum
-        x2 = np.concatenate((xp-xmax,xmax-xp))+xmax
-        y2 = np.concatenate((yp,yp))
-        # Need to sort or otherwise the dx in gparsmoments() will be wrong
-        si = np.argsort(x2)
-        x2,y2 = x2[si],y2[si]
-        # Need to get unique x-values, otherwise the amplitude will be artificially
-        #  inflated because we added more points
-        #_,ui = np.unique(x2,return_index=True)
-        ui = unique(x2) 
-        x2,y2 = x2[ui],y2[ui]
-        amp,cen0,sigma0 = gparsmoments(x2,y2)
-        good = ((np.abs(x-cen0) <= 3*sigma0) & np.isfinite(y))
+    # Get initial range using peakboundary
+    lo,hi = peakboundary(yp,int(np.round(xcen0)))
+    
+    # Get improved center from bisector
+    cen0 = gparscenbisector(xp[lo:hi],yp[lo:hi],xcen0)
+
+    # Get initial sigma from second moment 
+    totyp = np.sum(yp[lo:hi])                                    # 0th moment
+    sigma0 = np.sqrt(np.sum(y[lo:hi]*(x[lo:hi]-cen0)**2)/totyp)  # 2nd central moment
+
+    # Get good pixels and
+    #  limit to the peakboundary() lo:hi range
+    index = np.arange(len(x))
+    good = ((np.abs(x-cen0) <= 3*sigma0) & np.isfinite(y) &
+            (index >= lo) & (index <= hi))
         
     xp = x[good]
     yp = y[good]
+    yp = np.maximum(yp,0)
     u0 = (xp-cen0)**2
     
     # Use sigma search
     u0 = np.abs(xp-cen0)
     amp1,sigma1,offset1,chisq1 = gparssigmasearch(u0,yp)
-
+    
     # Improve center estimate with cross-correlation
     # somewhat slower: 24 microseconds
     coef1 = np.zeros(4,float)
@@ -1110,102 +1198,54 @@ def gpars1(x,y):
     coef1[3] = offset1
     cen1 = gaussxccenter(xp,yp,coef1)
     
-    # Iterate: Use sigma search
+    # Iterate: Use sigma search again
     u1 = np.abs(xp-cen1)
     amp2,sigma2,offset2,chisq2 = gparssigmasearch(u1,yp)   
 
-    # Make sure new solution is better
+    # Check the solution with no offset
+    logcoef = gparslog(xp,yp)
+    logchisq = np.sum((yp-gaussian(xp,logcoef))**2)
+
+    # Use the best solution
+    besttype = np.argmin(np.array([chisq1,chisq2,logchisq]))
     coef = np.zeros(4,float)
-    if chisq2 <= chisq1:
-        coef[0] = amp2
-        coef[1] = cen1
-        coef[2] = sigma2
-        coef[3] = offset2
-    # New solution is worse, revert to prevous one
-    else:
+    # 1st sigma search
+    if besttype==0:
         coef[0] = amp1
         coef[1] = cen0
         coef[2] = sigma1
         coef[3] = offset1
-    
-    # Get initial estimate of amplitude and offset from flux differences
-    # fast, 12 micro seconds
-    #A0,offset0 = gparsampdiffs(np.abs(xp-cen0)/sig0,yp)
-    
-    # Use Gaussian polynomial approximation to estimate amplitude and offset
-    #A0,offset0 = gparspoly(u0/sig0**2,yp)
-    
-    # Get improved sigma estimate using u/y scaling
-    # fast: 12 microseconds
-    #sig1 = gparssigmascale(u0,(yp-offset0)/A0)
-    
-    # Iterate: Re-estimate center with cross-correlation
-    # somewhat slower: 24 microseconds
-    #coef0 = np.array([A0,cen0,sig1,offset0])
-    #cen1 = gaussxccenter(xp,yp,coef0)
-    #u1 = (xp-cen1)**2
-    
-    # Iterate: Re-estimate A and offset with the improved sigma value
-    ##A1,offset1 = gparspoly(u1/sig1**2,yp)
-    #A1,offset1 = gparsampdiffs(np.abs(xp-cen1)/sig1,yp)
-    # doesn't improve really
-    
-    # fit amplitude and offset by using a linear fit of the model
-    # (slope is the amplitude and y-offset is the offset term)
-    # fast: 2 microseconds
-    #tcoef = np.array([1.0,cen1,sig1])
-    #A2,offset2 = gparsmodelscale(xp,yp,tcoef)
-    # doesn't improve really
+    # 2nd sigma search, with xcorr center
+    elif besttype==1:
+        coef[0] = amp2
+        coef[1] = cen1
+        coef[2] = sigma2
+        coef[3] = offset2
+    # Log method, no offset
+    elif besttype==2:
+        # If the log method with no offset is best, then
+        # maybe the offset is small
+        # Try to estimate amp and offset with the
+        # log method sigma
+        yf = gaussian(xp,np.array([1.0,logcoef[1],logcoef[2]]))
+        # solve for Amp and offset
+        amp,off = linregression(yf,yp)
+        model = yf*amp+off
+        chisqoff = np.sum((y-model)**2)
+        # Small offset better
+        if chisqoff < logchisq:
+            coef[0] = amp
+            coef[1] = logcoef[1]
+            coef[2] = logcoef[2]
+            coef[3] = off
+        # No offset better
+        else:
+            coef[0] = logcoef[0]
+            coef[1] = logcoef[1]
+            coef[2] = logcoef[2]
+            coef[3] = 0                
 
     return coef
-    
-@njit
-def gpars1log(x,y):
-    """
-    Simple Gaussian fit to central 5 pixel values.
-
-    Parameters
-    ----------
-    x : numpy array
-       Numpy array of x-values.
-    y : numpy array
-       Numpy array of flux values.
-
-    Returns
-    -------
-    pars : numpy array
-       Gaussian parameters [height, center, sigma].  If multiple
-       profiles are input, then the output dimensions are [3].
-
-    Example
-    -------
-    
-    pars = gpars1(x,y)
-
-    """
-    pars = np.zeros(3,float)
-    nx = len(y)
-    nhalf = nx//2
-    gd = (np.isfinite(y) & (y>0))
-    #if np.sum(gd)<5:
-    x = x[gd]
-    y = y[gd]
-    totflux = np.sum(y)
-    ht0 = y[nhalf]
-    if np.isfinite(ht0)==False:
-        ht0 = np.max(y)
-    # Use flux-weighted moment to get center
-    cen1 = np.sum(y*x)/totflux
-    #  Gaussian area is A = ht*wid*sqrt(2*pi)
-    sigma1 = np.maximum( totflux/(ht0*np.sqrt(2*np.pi)) , 0.01)
-    # Use linear-least squares to calculate height and sigma
-    psf = np.exp(-0.5*(x-cen1)**2/sigma1**2)          # normalized Gaussian
-    wtht = np.sum(y*psf)/np.sum(psf*psf)          # linear least squares
-    
-    # Directly solve for the parameters using ln(y)
-    pars = gparslog(x,y)
-
-    return pars
 
 @njit
 def gpars(xprofiles,yprofiles,npixprofiles):
@@ -1220,8 +1260,7 @@ def gpars(xprofiles,yprofiles,npixprofiles):
        Numpy array of flux values.  Can be a single or
        mulitple profiles.  If mulitple profiles, the dimensions
        should be [Nprofiles,5].
-    
-    
+
     Returns
     -------
     pars : numpy array
@@ -1275,82 +1314,4 @@ def gpars(xprofiles,yprofiles,npixprofiles):
         
     return pars
 
-@njit
-def peakboundary(y,cen):
-    """
-    Find the boundary of the peak.
-    Can be where the values start to increase again, or
-    hit the edge of the array
 
-    Parameters
-    ----------
-    y : numpy array
-       Numpy array of the peak flux array.
-    cen : float
-       Estimate of the peak center.
-
-    Returns
-    -------
-    low : int
-       Index of the lower edge of the peak.
-    high : int
-       Index of the upper edge of the peak.
-
-    Example
-    -------
-
-    low,high = peakboundary(y,cen)
-
-    """
-
-    n = len(y)
-    peak = y[cen]
-    
-    # Walk to lower boundary
-    flag = 0
-    count = 0
-    last_y = peak
-    last_position = cen
-    position = cen-1
-    while (flag==0):
-        y1 = y[position]        
-        # need to stop
-        if y1<0.5*peak and y1>=last_y:
-            flag = 1
-            low = position+1
-        # at lower edge, stop
-        elif position==0:
-            flag = 1
-            low = position
-        # keep going
-        else:
-            position -= 1
-        count += 1   # increment counter
-        # keep last values
-        last_y = y1
-        last_position = position
-        
-    # Walk to upper boundary
-    flag = 0
-    count = 0
-    last_y = peak
-    last_position = cen
-    position = cen+1
-    while (flag==0):
-        y1 = y[position]
-        # need to stop
-        if y1<0.5*peak and y1>=last_y:
-            flag = 1
-            high = position-1
-        elif position==n-1:
-            flag = 1
-            high = position
-        # keep going
-        else:
-            position += 1
-        count += 1   # increment counter
-        # keep last values
-        last_y = y1
-        last_position = position
-    
-    return low,high
