@@ -98,6 +98,67 @@ def gvals(ycen,ysigma,y):
     return model
 
 @njit
+def gradient(f):
+    """
+    Determine the gradient of an array.
+
+    Parameters
+    ----------
+    f : numpy array
+      The array to find the gradient of.
+
+    Returns
+    -------
+    grad : numpy array
+       The gradient of x.
+
+    Example
+    -------
+
+    grad = gradient(f)
+
+    """
+
+    out = np.zeros(len(f),float)
+
+    # Copied from numpy/lib/function_base.py gradient()
+    # assuming uniform spacing
+    
+    # Numerical differentiation: 2nd order interior
+    #slice1 = slice(1, -1)
+    #slice2 = slice(None, -2)
+    #slice3 = slice(1, -1)
+    #slice4 = slice(2, None)
+    #out[tuple(slice1)] = (f[tuple(slice4)] - f[tuple(slice2)]) / (2. * ax_dx)
+    out[1:-1] = (f[2:] - f[:-2]) / 2.0
+    
+    # Bottom edge
+    #slice1[axis] = 0
+    #slice2[axis] = 0
+    #slice3[axis] = 1
+    #slice4[axis] = 2
+    a = -1.5
+    b = 2.
+    c = -0.5
+    # 1D equivalent -- out[0] = a * f[0] + b * f[1] + c * f[2]
+    #out[tuple(slice1)] = a * f[tuple(slice2)] + b * f[tuple(slice3)] + c * f[tuple(slice4)]
+    out[0] = a * f[0] + b * f[1] + c * f[2]    
+
+    # Top edge
+    #slice1[axis] = -1
+    #slice2[axis] = -3
+    #slice3[axis] = -2
+    #slice4[axis] = -1
+    a = 0.5
+    b = -2.
+    c = 1.5
+    # 1D equivalent -- out[-1] = a * f[-3] + b * f[-2] + c * f[-1]
+    #out[tuple(slice1)] = a * f[tuple(slice2)] + b * f[tuple(slice3)] + c * f[tuple(slice4)]
+    out[-1] = a * f[-3] + b * f[-2] + c * f[-1]    
+
+    return out
+
+@njit
 def polyval(coef,x):
     """ Evaluation polynomial. """
     nc = len(coef)
@@ -134,7 +195,39 @@ def linregression(x,y):
     slope = np.sum((x-mnx)*(y-mny))/np.sum((x-mnx)**2)
     yoff = mny-slope*mnx
     return slope,yoff
+
+@njit
+def gparscenpeak(y):
+    """
+    Estimate central position using the maximum point and
+    the neighboring values.
+
+    Parameters
+    ----------
+    y : numpy array
+       Numpy array of flux values.
+
+    Returns
+    -------
+    center : float
+       Center value.
+
+    Example
+    -------
     
+    cen = gparsmoments(y)
+
+    """
+
+    n = len(y)
+    x = np.arange(n)
+    maxind = np.argmax(y)
+    # Now fit quadratic equation to peak and neighboring pixels
+    lo = np.maximum(maxind-1,0)
+    hi = np.minimum(maxind+2,n)
+    cen = quadratic_bisector(x[lo:hi],y[lo:hi])
+    return cen
+
 @njit
 def gparsmoments(x,y):
     """
@@ -340,6 +433,105 @@ def gparssigmasearch(u,y):
     chisq = np.sum(residsq)
 
     return amp,sigma,offset,chisq
+
+@njit
+def gparscenbisector(y,cen):
+    """
+    Use the symmetry of the curve to find the center
+
+    Parameters
+    ----------
+    y : numpy array
+       Numpy array of flux values.
+    cen : float
+       Initial guess of Gaussian center
+
+    Returns
+    -------
+    cen: float
+       Improved estimate of center
+
+    Example
+    -------
+    
+    cen = gparscenbisector(y,cen)
+
+    """
+
+    n = len(y)
+    # Central pixel to start with
+    xstart = int(np.ceil(cen))
+
+    # The basic idea is that I want to find the bisector
+    # of the peak
+    # For each pixel on one side, I want to find the expected position at the same
+    # flux level on the other side
+    ind = np.arange(n)
+    left = (ind < cen)
+    xleft = ind[left]
+    xright = ind[~left]
+    yleft = y[left]
+    yright = y[~left]
+    # flip right values so they are ascending
+    xright = np.flip(xright)
+    yright = np.flip(yright)
+    
+    # Interpolate right flux values using left points
+    #  only use values that are in the y-range of the other side    
+    gdright, = np.where((yright <= np.max(yleft)) & (yright >= np.min(yleft)))
+    xrightpair = np.interp(yright[gdright],yleft,xleft)
+
+    # Interpolate left flux values using right points
+    #  only use values that are in the y-range of the other side
+    gdleft, = np.where((yleft <= np.max(yright)) & (yleft >= np.min(yright)))    
+    xleftpair = np.interp(yleft[gdleft],yright,xright)
+
+    # Find the mid-point for each set of flux values
+    # left values and right-side pairs
+    xleftmid = 0.5*(xleft[gdleft]+xleftpair)
+    # right values and left-side pairs
+    xrightmid = 0.5*(xright[gdright]+xrightpair)
+
+    mids = np.concatenate((xleftmid,xrightmid))
+    newcen = np.mean(mids)
+
+    return newcen
+
+@njit
+def gparssigmaderiv(x,y,cen):
+    """
+    Use the first derivative to estimate sigma.
+
+    Parameters
+    ----------
+    x : numpy array
+       Numpy array of the x-values.
+    y : numpy array
+       Numpy array of flux values.
+    cen : float
+       The Gaussian center.
+
+    Returns
+    -------
+    sigma : float
+       The Gaussian sigma value.
+
+    Example
+    -------
+    
+    sigma = gparssigmaderiv(x,y,cen)
+
+    """
+
+    # can use derivative to get sigma, but need to know the offset
+    # from gaussfithi5.pro
+    dx = x[1]-x[0]
+    dfdx = gradient(y)/dx
+    u = x-cen
+    r10 = dfdx/y
+    slope,yoff = linregression(u,r10)
+    sigma = np.sqrt(-1/slope)
+    return sigma
 
 @njit
 def gparspolyiter(u,y):
