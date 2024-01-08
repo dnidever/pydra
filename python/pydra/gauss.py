@@ -2,7 +2,7 @@
 
 # Imports
 import numpy as np
-from numba import njit,jit
+from numba import njit
 from dlnpyutils import utils as dln,robust
 
 # Functions for estimating Gaussian parameters of peaks
@@ -31,7 +31,7 @@ def quadratic_coefficients(x,y):
     coef = [a,b,c]
     return coef
 
-@njit
+@njit    
 def quadratic_bisector(x,y):
     """ Calculate the axis of symmetric or bisector of parabola"""
     # https://www.azdhs.gov/documents/preparedness/state-laboratory/lab-licensure-certification/technical-resources/
@@ -53,7 +53,7 @@ def quadratic_bisector(x,y):
     a = ( Sx2y*Sxx - Sxy*Sxx2 ) / denom
     b = ( Sxy*Sx2x2 - Sx2y*Sxx2 ) / denom
     if a==0:
-        return np.nan
+        return np.nan    
     return -b/(2*a)
 
 @njit
@@ -385,7 +385,7 @@ def gparsamppoly(usq,y):
     return amp,offset
 
 @njit
-def gparssigmasearch_chisq(u,y,sigma):
+def gparssigmasearch_solve(u,y,sigma):
     # Scale y to get Amp and offset
     yf = gaussian(u,np.array([1.0,0.0,sigma]))
     # solve for Amp and offset
@@ -393,10 +393,10 @@ def gparssigmasearch_chisq(u,y,sigma):
     model = yf*amp+off
     residsq = (y-model)**2
     chisq = np.sum(residsq)
-    return chisq
+    return amp,off,chisq
 
 @njit
-def gparssigmasearch(u,y):
+def gparssigmasearch(u,y,sigma0):
     """ 
     Search a region of sigma finding the best chiqsq value.
 
@@ -407,6 +407,8 @@ def gparssigmasearch(u,y):
          NOT scaled by sigma.
     y : numpy array
        Numpy array of flux values.
+    sigma0 : float
+       Initial sigma estimate.
 
     Returns
     -------
@@ -422,7 +424,7 @@ def gparssigmasearch(u,y):
     Example
     -------
     
-    amp,sigma,offset,chisq = gparssigmasearch(u,y)
+    amp,sigma,offset,chisq = gparssigmasearch(u,y,3.0)
 
     """
                   
@@ -432,7 +434,7 @@ def gparssigmasearch(u,y):
     # Assume u extends to 3*sigma
     usq = u**2
     umax = np.max(np.abs(u))
-    sigma0 = umax/3.0
+    #sigma0 = umax/3.0
 
     # Initialize large arrays to hold the chisq and sigma values
     sigmaarr = np.zeros(100,float)    
@@ -440,7 +442,7 @@ def gparssigmasearch(u,y):
     count = 0
 
     # Get chisq of initial sigma value
-    chisq0 = gparssigmasearch_chisq(u,y,sigma0)
+    amp0,off0,chisq0 = gparssigmasearch_solve(u,y,sigma0)
     sigmaarr[count] = sigma0
     chisqarr[count] = chisq0
     count += 1
@@ -450,7 +452,7 @@ def gparssigmasearch(u,y):
     last_chisq = chisq0
     flag = 0
     while (flag==0):
-        chisq = gparssigmasearch_chisq(u,y,sigma)
+        amp,off,chisq = gparssigmasearch_solve(u,y,sigma)
         sigmaarr[count] = sigma
         chisqarr[count] = chisq
         count += 1
@@ -466,7 +468,7 @@ def gparssigmasearch(u,y):
     last_chisq = chisq0
     flag = 0
     while (flag==0):
-        chisq = gparssigmasearch_chisq(u,y,sigma)
+        amp,off,chisq = gparssigmasearch_solve(u,y,sigma)
         sigmaarr[count] = sigma
         chisqarr[count] = chisq
         count += 1
@@ -484,37 +486,145 @@ def gparssigmasearch(u,y):
     si = np.argsort(sigmaarr)
     sigmaarr = sigmaarr[si]
     chisqarr = chisqarr[si]
-
-    # Get two more points by the minimum
-    bestind = np.argmin(chisqarr)
-    sigmalo = 0.5*(sigmaarr[bestind-1]+sigmaarr[bestind])
-    chisqlo = gparssigmasearch_chisq(u,y,sigmalo)
-    sigmahi = 0.5*(sigmaarr[bestind]+sigmaarr[bestind+1])    
-    chisqhi = gparssigmasearch_chisq(u,y,sigmahi)
-    sigmaarr = np.concatenate((sigmaarr,np.array([sigmalo,sigmahi])))
-    chisqarr = np.concatenate((chisqarr,np.array([chisqlo,chisqhi])))
-    # sort again
-    si = np.argsort(sigmaarr)
-    sigmaarr = sigmaarr[si]
-    chisqarr = chisqarr[si]    
     bestind = np.argmin(chisqarr)
     
     # Fit quadratic equation to best value and neighboring points
     sigma = quadratic_bisector(sigmaarr[bestind-1:bestind+2],
                                chisqarr[bestind-1:bestind+2])
+    dum = np.zeros(1,float)  # need to do this otherwise numba will crash
+    dum[0] = sigma
+    sigma = dum[0]
+    
+    # Now get amp and offset for the interpolated sigma value
+    amp,offset,chisq = gparssigmasearch_solve(u,y,sigma)
 
-    # Now get amp and offset
-    coef = np.zeros(3,float)  # numba is requiring me to do it this way
-    coef[0] = 1
-    coef[2] = sigma
-    yf = gaussian(u,coef)
-    # solve for Amp and offset
-    amp,offset = linregression(yf,y)
-    model = yf*amp+offset
-    residsq = (y-model)**2
-    chisq = np.sum(residsq)
-
+    # Make sure to take the best chisq solution
+    if chisqarr[bestind] < chisq:
+        sigma = sigmaarr[bestind]
+        amp,offset,chisq = gparssigmasearch_solve(u,y,sigma)
+            
     return amp,sigma,offset,chisq
+
+
+@njit
+def gparssearch(x,y,cen0):
+    """ 
+    Search a region of center and sigma finding the best chiqsq value.
+
+    Parameters
+    ----------
+    x : numpy array
+       Numpy array of the shifted x-values.
+    y : numpy array
+       Numpy array of flux values.
+    cen0 : float
+       Initial estimate for center.
+
+    Returns
+    -------
+    amp : float
+       The Gaussian amplitude value.
+    center : float
+       The Gaussian center value.
+    sigma : float
+       The Gaussian sigma value.
+    offset : float
+       The constant offset.
+    chisq : float
+       The best chisq value.
+
+    Example
+    -------
+    
+    amp,center,sigma,offset,chisq = gparssearch(x,y,5.0)
+
+    """
+
+    dx = x[1]-x[0]
+    
+    # Assume u extends to 3*sigma
+    umax = np.max(np.abs(x-cen0))
+    sig0 = umax/3.0
+
+    # Initialize large arrays to hold the chisq and sigma values
+    cenarr = np.zeros(100,float)
+    sigmaarr = np.zeros(100,float)    
+    chisqarr = np.zeros(100,float)
+    count = 0
+
+    # Get chisq of initial cen value
+    u0 = np.abs(x-cen0)
+    amp0,sigma0,off0,chisq0 = gparssigmasearch(u0,y,sig0)
+    cenarr[count] = cen0
+    sigmaarr[count] = sigma0    
+    chisqarr[count] = chisq0
+    count += 1
+    
+    # Find inner edge where chisq starts to increase
+    step = 0.1*dx
+    cen = cen0-step
+    last_chisq = chisq0
+    flag = 0
+    while (flag==0):
+        u = np.abs(x-cen)
+        amp,sigma,off,chisq = gparssigmasearch(u,y,sigma0)
+        sigmaarr[count] = sigma
+        cenarr[count] = cen      
+        chisqarr[count] = chisq
+        count += 1
+        if chisq < last_chisq:
+            cen -= step
+        else:
+            flag = 1
+        last_chisq = chisq
+    low_cen = cen
+
+    # Find upper edge where chisq starts to increase
+    cen = cen0+step
+    last_chisq = chisq0
+    flag = 0
+    while (flag==0):
+        u = np.abs(x-cen)
+        amp,sigma,off,chisq = gparssigmasearch(u,y,sigma0)
+        sigmaarr[count] = sigma
+        cenarr[count] = cen   
+        chisqarr[count] = chisq
+        count += 1
+        if chisq < last_chisq:
+            cen += step
+        else:
+            flag = 1
+        last_chisq = chisq
+    high_cen = cen
+    
+    # Trim the chisq/sigma values
+    sigmaarr = sigmaarr[0:count]
+    cenarr = cenarr[0:count]    
+    chisqarr = chisqarr[0:count]
+    # sort them
+    si = np.argsort(cenarr)
+    sigmaarr = sigmaarr[si]
+    cenarr = cenarr[si]    
+    chisqarr = chisqarr[si]
+    bestind = np.argmin(chisqarr)
+    
+    # Fit quadratic equation to best value and neighboring points
+    center = quadratic_bisector(cenarr[bestind-1:bestind+2],
+                                chisqarr[bestind-1:bestind+2])
+    sigmabest = sigmaarr[bestind]
+
+    # Now get amp, sigma and offset for interpolated center value
+    u = np.abs(x-cen)
+    amp,sigma,offset,chisq = gparssigmasearch(u,y,sigmabest)   
+
+    # Make sure to take the best chisq solution
+    if chisqarr[bestind] < chisq:
+        center = cenarr[bestind]
+        sigma = sigmaarr[bestind]
+        u = np.abs(x-center)
+        amp,offset,chisq = gparssigmasearch_solve(u,y,sigma)
+    
+    return amp,center,sigma,offset,chisq
 
 @njit
 def gparscenbisector(x,y,cen):
@@ -1150,7 +1260,7 @@ def gpars1(x,y):
 
     """
 
-    # This takes about 85 microseconds for 10 points
+    # This takes about 145 microseconds for 10 points
 
     dx = x[1]-x[0]
     yp = np.maximum(y,0)
@@ -1184,45 +1294,24 @@ def gpars1(x,y):
     yp = y[good]
     yp = np.maximum(yp,0)
     u0 = (xp-cen0)**2
-    
-    # Use sigma search
-    u0 = np.abs(xp-cen0)
-    amp1,sigma1,offset1,chisq1 = gparssigmasearch(u0,yp)
-    
-    # Improve center estimate with cross-correlation
-    # somewhat slower: 24 microseconds
-    coef1 = np.zeros(4,float)
-    coef1[0] = amp1
-    coef1[1] = cen0
-    coef1[2] = sigma1
-    coef1[3] = offset1
-    cen1 = gaussxccenter(xp,yp,coef1)
-    
-    # Iterate: Use sigma search again
-    u1 = np.abs(xp-cen1)
-    amp2,sigma2,offset2,chisq2 = gparssigmasearch(u1,yp)   
+
+    # Use sigma + center search
+    amp,center,sigma,offset,chisq = gparssearch(xp,yp,cen0)
 
     # Check the solution with no offset
     logcoef = gparslog(xp,yp)
     logchisq = np.sum((yp-gaussian(xp,logcoef))**2)
 
     # Use the best solution
-    besttype = np.argmin(np.array([chisq1,chisq2,logchisq]))
     coef = np.zeros(4,float)
-    # 1st sigma search
-    if besttype==0:
-        coef[0] = amp1
-        coef[1] = cen0
-        coef[2] = sigma1
-        coef[3] = offset1
-    # 2nd sigma search, with xcorr center
-    elif besttype==1:
-        coef[0] = amp2
-        coef[1] = cen1
-        coef[2] = sigma2
-        coef[3] = offset2
+    # search method
+    if chisq < logchisq:
+        coef[0] = amp
+        coef[1] = center
+        coef[2] = sigma
+        coef[3] = offset
     # Log method, no offset
-    elif besttype==2:
+    else:
         # If the log method with no offset is best, then
         # maybe the offset is small
         # Try to estimate amp and offset with the
